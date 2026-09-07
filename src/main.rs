@@ -4,6 +4,7 @@ mod eval;
 mod git;
 mod orchestrator;
 mod prompt;
+mod resume;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,53 @@ async fn main() -> anyhow::Result<()> {
             "current directory is not a git repo (deltastack requires git for keep/revert)"
         );
     }
+
+    // ---- resume vs fresh start ----
+    // Resumed state (None for fresh runs).
+    let resumed: Option<resume::ResumedState> = if cli.resume {
+        let records = resume::load_records(&cli.state_file).await?;
+        for w in resume::config_warnings(&records, &cli) {
+            warn!("resume: {w}");
+        }
+        let r = resume::derive_resume(&records, &cli)?;
+        if r.next_iteration > cli.max_iterations {
+            info!(
+                "already complete: next iteration {} > max {} (best={:?} sha={})",
+                r.next_iteration, cli.max_iterations, r.best, r.best_sha
+            );
+            println!(
+                "already complete: best={:?} sha={} (all {} iterations done)",
+                r.best, r.best_sha, cli.max_iterations
+            );
+            return Ok(());
+        }
+        if !git::commit_exists(&repo, &r.best_sha).await {
+            anyhow::bail!(
+                "resume best_sha {} not found in this repo; clone/fetch the right history first",
+                r.best_sha
+            );
+        }
+        info!(
+            "resuming at iteration {}/{} (best={:?} sha={} fails_since_best={} target_streak={})",
+            r.next_iteration,
+            cli.max_iterations,
+            r.best,
+            r.best_sha,
+            r.fails_since_best,
+            r.target_streak
+        );
+        git::reset_hard(&repo, &r.best_sha).await?;
+        Some(r)
+    } else {
+        if resume::state_file_has_content(&cli.state_file).await {
+            anyhow::bail!(
+                "state file {:?} already has records; pass --resume to continue or delete it for a fresh run",
+                cli.state_file
+            );
+        }
+        None
+    };
+
     if !cli.allow_dirty && !git::is_clean_filtered(&repo, &cli.state_file, &cli.log_dir).await? {
         anyhow::bail!("git tree is dirty; commit/stash first or pass --allow-dirty");
     }
@@ -84,51 +132,67 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cli.delay_between_eval)
     };
 
-    // ---- baseline ----
-    let baseline_sha = git::current_sha(&repo).await?;
-    info!("baseline commit {baseline_sha}");
-    let baseline_samples = run_eval_for_kind(
-        &eval_kind,
-        repo.clone(),
-        cli.samples,
-        cli.effective_eval_jobs(),
-        eval_timeout(&cli),
-        Some(PathBuf::from(&cli.log_dir)),
-        0,
-        99,
-        cli.eval_retries,
-        eval_retry_delay,
-    )
-    .await;
-    let baseline_scores: Vec<Option<f64>> = baseline_samples.iter().map(|s| s.score).collect();
-    let mut best = orchestrator::score_candidate(&baseline_samples, cli.aggregate);
-    let mut best_sha = baseline_sha.clone();
-    info!("baseline samples={baseline_scores:?} agg={best:?}");
+    // ---- loop state: restored on resume, else fresh baseline ----
+    let (mut best, mut best_sha, mut fails_since_best, mut last_score, mut target_hits, first_iter) =
+        match resumed {
+            Some(r) => {
+                cleanup_stale_worktrees(&repo, &cli).await;
+                let next = r.next_iteration;
+                (
+                    r.best,
+                    r.best_sha,
+                    r.fails_since_best,
+                    r.last_score,
+                    r.target_streak,
+                    next,
+                )
+            }
+            None => {
+                // Config header first so later resumes can warn on drift.
+                state::append_record(&cli.state_file, &resume::make_config_record(&cli)).await?;
+                let baseline_sha = git::current_sha(&repo).await?;
+                info!("baseline commit {baseline_sha}");
+                let baseline_samples = run_eval_for_kind(
+                    &eval_kind,
+                    repo.clone(),
+                    cli.samples,
+                    cli.effective_eval_jobs(),
+                    eval_timeout(&cli),
+                    Some(PathBuf::from(&cli.log_dir)),
+                    0,
+                    99,
+                    cli.eval_retries,
+                    eval_retry_delay,
+                )
+                .await;
+                let baseline_scores: Vec<Option<f64>> =
+                    baseline_samples.iter().map(|s| s.score).collect();
+                let b = orchestrator::score_candidate(&baseline_samples, cli.aggregate);
+                info!("baseline samples={baseline_scores:?} agg={b:?}");
 
-    state::append_record(
-        &cli.state_file,
-        &state::IterationRecord {
-            iteration: 0,
-            agent_idx: 0,
-            kind: state::RecordKind::Baseline,
-            commit: Some(baseline_sha.clone()),
-            worktree: None,
-            samples: baseline_scores,
-            agg: best,
-            best,
-            best_sha: Some(best_sha.clone()),
-            decision: Some("baseline".into()),
-            agent_exit: None,
-            note: None,
-        },
-    )
-    .await?;
+                state::append_record(
+                    &cli.state_file,
+                    &state::IterationRecord {
+                        iteration: 0,
+                        agent_idx: 0,
+                        kind: state::RecordKind::Baseline,
+                        commit: Some(baseline_sha.clone()),
+                        worktree: None,
+                        samples: baseline_scores,
+                        agg: b,
+                        best: b,
+                        best_sha: Some(baseline_sha.clone()),
+                        decision: Some("baseline".into()),
+                        agent_exit: None,
+                        note: None,
+                    },
+                )
+                .await?;
+                (b, baseline_sha, 0, b, 0, 1)
+            }
+        };
 
-    let mut fails_since_best: u32 = 0;
-    let mut last_score = best;
-    let mut target_hits: u32 = 0;
-
-    for iter in 1..=cli.max_iterations {
+    for iter in first_iter..=cli.max_iterations {
         if orchestrator::wall_time_exceeded(run_start.elapsed(), cli.max_wall_time) {
             info!(
                 "stopping: wall-time budget {}s exceeded after {} iterations",
@@ -443,6 +507,35 @@ async fn run_single_agent(
     })
 }
 
+/// Best-effort removal of leftover per-agent worktrees/branches from a
+/// crashed run. Skipped when `keep_worktrees` is set or when running in-place.
+async fn cleanup_stale_worktrees(repo: &Path, cli: &Cli) {
+    if !cli.uses_worktree_isolation() || cli.keep_worktrees {
+        return;
+    }
+    let list = match git::list_worktrees(repo).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("resume: cannot list worktrees for cleanup: {e:#}");
+            return;
+        }
+    };
+    for (path, branch) in &list {
+        let Some(b) = branch.as_deref() else { continue };
+        if !b.starts_with(&cli.branch_prefix) {
+            continue;
+        }
+        info!("resume: removing stale worktree {b} at {}", path.display());
+        if let Err(e) = git::remove_worktree(repo, path, cli.wt_force).await {
+            warn!("resume: cannot remove worktree {b}: {e:#}");
+            continue;
+        }
+        if let Err(e) = git::delete_branch(repo, b, true).await {
+            warn!("resume: cannot delete branch {b}: {e:#}");
+        }
+    }
+}
+
 /// Find the worktree zerostack created for this agent.
 async fn resolve_agent_worktree(
     repo: &Path,
@@ -550,6 +643,65 @@ async fn run_eval_for_kind(
 }
 
 fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result<()> {
+    if cli.resume {
+        match std::fs::read_to_string(&cli.state_file) {
+            Ok(content) => match resume::parse_records_content(&content) {
+                Ok(records) => {
+                    for w in resume::config_warnings(&records, cli) {
+                        println!("warning: resume: {w}");
+                    }
+                    match resume::derive_resume(&records, cli) {
+                        Ok(r) => {
+                            println!(
+                                "resume: next_iteration={} best={:?} sha={} fails_since_best={} target_streak={}",
+                                r.next_iteration,
+                                r.best,
+                                r.best_sha,
+                                r.fails_since_best,
+                                r.target_streak
+                            );
+                            if r.next_iteration > cli.max_iterations {
+                                println!("already complete: nothing to run");
+                                return Ok(());
+                            }
+                            let full = prompt::compose_iteration_prompt(
+                                user_prompt,
+                                r.next_iteration,
+                                cli.max_iterations,
+                                0,
+                                cli.agents,
+                                r.best,
+                                Some(&r.best_sha),
+                                r.last_score,
+                                &cli.branch_prefix,
+                                !cli.no_auto_commit_prompt,
+                            );
+                            let argv = agent::build_zerostack_argv(cli, r.next_iteration, 0, &full);
+                            println!(
+                                "zerostack argv:\n{} {}",
+                                cli.zerostack_bin,
+                                shlex::try_join(argv.iter().map(String::as_str))
+                                    .unwrap_or_default()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!("resume failed: {e:#}");
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("resume failed: {e:#}");
+                    return Ok(());
+                }
+            },
+            Err(e) => {
+                println!("resume failed: cannot read {:?}: {e:#}", cli.state_file);
+                return Ok(());
+            }
+        }
+    }
     let full = prompt::compose_iteration_prompt(
         user_prompt,
         1,

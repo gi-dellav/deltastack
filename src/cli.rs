@@ -215,6 +215,14 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub no_auto_commit_fallback: bool,
 
+    // ---------- Resume ----------
+    /// Resume from an existing state file instead of starting fresh.
+    /// Continues at the first incomplete iteration, resets the checkout to
+    /// the saved best commit, and skips re-running the baseline eval.
+    /// The trailing partial iteration (if any) is discarded and re-run.
+    #[arg(long, default_value_t = false)]
+    pub resume: bool,
+
     // ---------- Output ----------
     /// JSONL run log path.
     #[arg(long, default_value = "deltastack.jsonl")]

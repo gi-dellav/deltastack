@@ -210,6 +210,14 @@ pub async fn delete_branch(repo: &Path, branch: &str, force: bool) -> anyhow::Re
     Ok(())
 }
 
+/// True if `sha` exists in the repo (used to validate a resume point).
+pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
+    git(repo, &["cat-file", "-e", sha])
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Promote winner: point current checkout at `sha` (used after eval gate passes).
 /// NOTE: intentionally does NOT `git clean -fd` — untracked files (e.g. build
 /// outputs, and deltastack's own logs) are left alone; only tracked state reverts.
