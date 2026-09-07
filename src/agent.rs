@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use rand::RngExt;
 use tokio::process::Command;
 
 use crate::cli::Cli;
@@ -15,6 +16,27 @@ pub fn flatten_tools(tools: &[String]) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Resolve the effective temperature for one (iteration, agent).
+///
+/// Rules:
+/// - If `--temperature-min`/`--temperature-max` are set, draw a uniform
+///   random base in `[min, max]` (per agent run; `rng` decides determinism).
+/// - Otherwise the base is `--temperature` (None => no temperature flag).
+/// - If `--temperature-step` is set, `real_temp = base + step * current_step`
+///   with `current_step = iteration` (iterations start at 1).
+///
+/// All flags accept any finite f64, positive or negative.
+pub fn resolve_temperature(cli: &Cli, iteration: u32, rng: &mut impl RngExt) -> Option<f64> {
+    let base = match (cli.temperature_min, cli.temperature_max) {
+        (Some(min), Some(max)) => Some(rng.random_range(min..=max)),
+        _ => cli.temperature,
+    }?;
+    match cli.temperature_step {
+        Some(step) => Some(base + step * f64::from(iteration.max(1))),
+        None => Some(base),
+    }
 }
 
 /// Build the `zerostack` argv for one (iteration, agent).
@@ -66,7 +88,7 @@ pub fn build_zerostack_argv(
         argv.push("--max-agent-turns".into());
         argv.push(v.to_string());
     }
-    if let Some(v) = cli.temperature {
+    if let Some(v) = resolve_temperature(cli, iteration, &mut rand::rng()) {
         argv.push("--temperature".into());
         argv.push(v.to_string());
     }
@@ -338,5 +360,95 @@ mod tests {
         let argv = build_zerostack_argv(&c, 0, 0, "p");
         let pos = argv.iter().position(|a| a == "--sandbox-network").unwrap();
         assert_eq!(argv[pos + 1], "true");
+    }
+
+    #[test]
+    fn no_temperature_by_default() {
+        use rand::SeedableRng;
+        let c = cli(&[]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        assert_eq!(resolve_temperature(&c, 1, &mut rng), None);
+        let argv = build_zerostack_argv(&c, 1, 0, "p");
+        assert!(!argv.iter().any(|a| a == "--temperature"));
+    }
+
+    #[test]
+    fn fixed_temperature_passthrough() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature", "0.7"]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        assert_eq!(resolve_temperature(&c, 1, &mut rng), Some(0.7));
+        let argv = build_zerostack_argv(&c, 1, 0, "p");
+        let pos = argv.iter().position(|a| a == "--temperature").unwrap();
+        assert_eq!(argv[pos + 1], "0.7");
+    }
+
+    #[test]
+    fn random_temperature_within_range() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature-min", "0.2", "--temperature-max", "0.8"]);
+        for seed in 0..50 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let t = resolve_temperature(&c, 1, &mut rng).unwrap();
+            assert!((0.2..=0.8).contains(&t), "out of range: {t}");
+        }
+    }
+
+    #[test]
+    fn random_temperature_degenerate_range_is_constant() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature-min", "0.5", "--temperature-max", "0.5"]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        assert_eq!(resolve_temperature(&c, 3, &mut rng), Some(0.5));
+    }
+
+    #[test]
+    fn negative_random_range() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature-min", "-1.0", "--temperature-max", "-0.2"]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let t = resolve_temperature(&c, 1, &mut rng).unwrap();
+        assert!((-1.0..=-0.2).contains(&t), "out of range: {t}");
+    }
+
+    #[test]
+    fn temperature_step_applies_from_step_one() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature", "1.0", "--temperature-step", "0.1"]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        assert!((resolve_temperature(&c, 1, &mut rng).unwrap() - 1.1).abs() < 1e-12);
+        assert!((resolve_temperature(&c, 2, &mut rng).unwrap() - 1.2).abs() < 1e-12);
+        assert!((resolve_temperature(&c, 5, &mut rng).unwrap() - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn temperature_step_with_negative_values() {
+        use rand::SeedableRng;
+        let c = cli(&["--temperature", "-0.5", "--temperature-step", "-0.1"]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        assert!((resolve_temperature(&c, 1, &mut rng).unwrap() - -0.6).abs() < 1e-12);
+        assert!((resolve_temperature(&c, 3, &mut rng).unwrap() - -0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn temperature_step_applies_on_random_base() {
+        use rand::SeedableRng;
+        // Seeded draw must equal base; step shifts it by step * current_step.
+        let c = cli(&[
+            "--temperature-min",
+            "0.0",
+            "--temperature-max",
+            "1.0",
+            "--temperature-step",
+            "0.5",
+        ]);
+        let c_no_step = cli(&["--temperature-min", "0.0", "--temperature-max", "1.0"]);
+        for seed in [1u64, 2, 3] {
+            let mut r1 = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut r2 = rand::rngs::StdRng::seed_from_u64(seed);
+            let base = resolve_temperature(&c_no_step, 1, &mut r1).unwrap();
+            let stepped = resolve_temperature(&c, 2, &mut r2).unwrap();
+            assert!((stepped - (base + 0.5 * 2.0)).abs() < 1e-12);
+        }
     }
 }

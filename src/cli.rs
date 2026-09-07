@@ -102,8 +102,22 @@ pub struct Cli {
     #[arg(long)]
     pub max_agent_turns: Option<u32>,
     /// sampling temperature for the model
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub temperature: Option<f64>,
+    /// minimum sampling temperature for randomly generated temperatures
+    /// (requires --temperature-max; per-agent uniform random in [min, max]).
+    #[arg(long, allow_hyphen_values = true)]
+    pub temperature_min: Option<f64>,
+    /// maximum sampling temperature for randomly generated temperatures
+    /// (requires --temperature-min; per-agent uniform random in [min, max]).
+    #[arg(long, allow_hyphen_values = true)]
+    pub temperature_max: Option<f64>,
+    /// per-iteration temperature step: real_temp = base + step * current_step,
+    /// with current_step = iteration starting at 1. Base is the random
+    /// temperature when --temperature-min/--temperature-max are set,
+    /// otherwise --temperature. Requires a base temperature.
+    #[arg(long, allow_hyphen_values = true)]
+    pub temperature_step: Option<f64>,
     /// Allowlisted tools, comma-separated; repeatable. Passed as `--tools <CSV>`.
     #[arg(short, long = "tools")]
     pub tools: Vec<String>,
@@ -221,10 +235,48 @@ impl Cli {
         if !self.min_improvement.is_finite() || self.min_improvement < 0.0 {
             anyhow::bail!("--min-improvement must be a finite value >= 0");
         }
+        // All temperature flags accept any finite f64 (positive or negative).
         if let Some(t) = self.temperature {
-            if !(0.0..=2.0).contains(&t) {
-                anyhow::bail!("--temperature must be in 0.0..=2.0");
+            if !t.is_finite() {
+                anyhow::bail!("--temperature must be a finite floating point number");
             }
+        }
+        if let Some(t) = self.temperature_min {
+            if !t.is_finite() {
+                anyhow::bail!("--temperature-min must be a finite floating point number");
+            }
+        }
+        if let Some(t) = self.temperature_max {
+            if !t.is_finite() {
+                anyhow::bail!("--temperature-max must be a finite floating point number");
+            }
+        }
+        if let Some(t) = self.temperature_step {
+            if !t.is_finite() {
+                anyhow::bail!("--temperature-step must be a finite floating point number");
+            }
+        }
+        match (self.temperature_min, self.temperature_max) {
+            (Some(_), None) => {
+                anyhow::bail!("--temperature-min requires --temperature-max");
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("--temperature-max requires --temperature-min");
+            }
+            (Some(min), Some(max)) => {
+                if min > max {
+                    anyhow::bail!("--temperature-min must be <= --temperature-max");
+                }
+            }
+            (None, None) => {}
+        }
+        if self.temperature_step.is_some()
+            && self.temperature.is_none()
+            && (self.temperature_min.is_none() || self.temperature_max.is_none())
+        {
+            anyhow::bail!(
+                "--temperature-step requires a base temperature (--temperature or --temperature-min/--temperature-max)"
+            );
         }
         if self.no_isolate && self.agents > 1 {
             anyhow::bail!("--no-isolate cannot be used with --agents > 1 (parallel agents would clash on the same checkout)");
@@ -352,11 +404,97 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_temperature() {
+    fn accepts_any_finite_temperature() {
         let mut c = base_cli();
         c.temperature = Some(2.5);
-        assert!(c.validate().is_err());
+        assert!(c.validate().is_ok());
+        c.temperature = Some(-1.5);
+        assert!(c.validate().is_ok());
         c.temperature = Some(1.5);
+        assert!(c.validate().is_ok());
+        c.temperature = Some(f64::NAN);
+        assert!(c.validate().is_err());
+        c.temperature = Some(f64::INFINITY);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_temperature_range_and_step() {
+        let mut c = base_cli();
+        c.temperature_min = Some(0.0);
+        c.temperature_max = Some(f64::NAN);
+        assert!(c.validate().is_err());
+
+        let mut c = base_cli();
+        c.temperature_min = Some(f64::INFINITY);
+        c.temperature_max = Some(1.0);
+        assert!(c.validate().is_err());
+
+        let mut c = base_cli();
+        c.temperature = Some(0.5);
+        c.temperature_step = Some(f64::INFINITY);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn temperature_min_requires_max_and_vice_versa() {
+        let mut c = base_cli();
+        c.temperature_min = Some(0.1);
+        assert!(c.validate().is_err());
+
+        let mut c = base_cli();
+        c.temperature_max = Some(0.9);
+        assert!(c.validate().is_err());
+
+        let mut c = base_cli();
+        c.temperature_min = Some(0.1);
+        c.temperature_max = Some(0.9);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn temperature_min_must_not_exceed_max() {
+        let mut c = base_cli();
+        c.temperature_min = Some(1.0);
+        c.temperature_max = Some(0.5);
+        assert!(c.validate().is_err());
+
+        // Equal bounds = constant temperature, allowed.
+        c.temperature_max = Some(1.0);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn temperature_step_requires_base_temperature() {
+        let mut c = base_cli();
+        c.temperature_step = Some(0.1);
+        assert!(c.validate().is_err());
+
+        c.temperature = Some(0.5);
+        assert!(c.validate().is_ok());
+
+        let mut c = base_cli();
+        c.temperature_min = Some(0.1);
+        c.temperature_max = Some(0.9);
+        c.temperature_step = Some(-0.05);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn negative_temperatures_accepted() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--temperature",
+            "-0.5",
+            "--temperature-step",
+            "-0.1",
+        ]);
+        assert_eq!(c.temperature, Some(-0.5));
+        assert_eq!(c.temperature_step, Some(-0.1));
         assert!(c.validate().is_ok());
     }
 
