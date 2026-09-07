@@ -1,0 +1,394 @@
+use clap::{Parser, ValueEnum};
+
+/// deltastack: eval-gated autoresearch loop on top of zerostack.
+///
+/// Each iteration spawns fresh `zerostack -p` agents, scores candidates with
+/// your eval script (stdout = single float), keeps the best and reverts the rest.
+#[derive(Parser, Debug, Clone)]
+#[command(name = "deltastack", version, about)]
+pub struct Cli {
+    // ---------- Task definition ----------
+    /// Inline task prompt (conflicts with --prompt-file).
+    #[arg(short, long, conflicts_with = "prompt_file")]
+    pub prompt: Option<String>,
+
+    /// Read task prompt from file.
+    #[arg(long, conflicts_with = "prompt")]
+    pub prompt_file: Option<String>,
+
+    /// Eval shell command (run via `sh -c`). Stdout must be a single float.
+    #[arg(short, long = "eval")]
+    pub eval_cmd: String,
+
+    /// zerostack binary path.
+    #[arg(long, default_value = "zerostack")]
+    pub zerostack_bin: String,
+
+    // ---------- Loop / eval control ----------
+    /// Max outer-loop iterations.
+    #[arg(long, default_value_t = 10)]
+    pub max_iterations: u32,
+
+    /// Concurrent agents per iteration.
+    ///
+    /// When >1, each agent runs in its own worktree created via zerostack's
+    /// integrated `--worktree` (or `--parallel`) workflow flag.
+    #[arg(long, default_value_t = 1)]
+    pub agents: u32,
+
+    /// Measurements (eval runs) per candidate.
+    #[arg(long, default_value_t = 1)]
+    pub samples: u32,
+
+    /// Concurrent eval processes. 0 = auto (min(samples, agents*samples)).
+    #[arg(long, default_value_t = 0)]
+    pub eval_jobs: u32,
+
+    /// How to aggregate multiple samples into one score.
+    #[arg(long, value_enum, default_value_t = Aggregate::Mean)]
+    pub aggregate: Aggregate,
+
+    /// Whether higher or lower eval scores are better.
+    #[arg(long, value_enum, default_value_t = Mode::Minimize)]
+    pub mode: Mode,
+
+    /// Minimum improvement over global best to count as `keep`.
+    #[arg(long, default_value_t = 0.0)]
+    pub min_improvement: f64,
+
+    /// Stop after N consecutive iterations without improvement (0 = disabled).
+    #[arg(long, default_value_t = 0)]
+    pub patience: u32,
+
+    /// Early-stop once this score is reached/exceeded (mode-aware).
+    #[arg(long)]
+    pub target: Option<f64>,
+
+    /// Timeout per agent run in seconds (0 = none).
+    #[arg(long, default_value_t = 0)]
+    pub agent_timeout: u64,
+
+    /// Timeout per single eval run in seconds (0 = none).
+    #[arg(long, default_value_t = 600)]
+    pub eval_timeout: u64,
+
+    /// Disable git auto-revert on non-improving iterations.
+    #[arg(long, default_value_t = false)]
+    pub no_revert: bool,
+
+    /// Allow starting with a dirty git tree (default: require clean).
+    #[arg(long, default_value_t = false)]
+    pub allow_dirty: bool,
+
+    /// Branch prefix for per-agent worktree branches.
+    #[arg(long, default_value = "deltastack/")]
+    pub branch_prefix: String,
+
+    /// Keep failed/candidate worktrees for debugging (default: remove).
+    #[arg(long, default_value_t = false)]
+    pub keep_worktrees: bool,
+
+    // ---------- zerostack agent passthrough (explicit subset) ----------
+    #[arg(long)]
+    pub provider: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub quick_model: Option<String>,
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+    #[arg(long)]
+    pub max_agent_turns: Option<u32>,
+    #[arg(long)]
+    pub temperature: Option<f64>,
+    /// Allowlisted tools, comma-separated; repeatable. Passed as `--tools <CSV>`.
+    #[arg(short, long = "tools")]
+    pub tools: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub no_context_files: bool,
+    #[arg(long, default_value_t = false)]
+    pub accept_all: bool,
+    #[arg(long, default_value_t = false)]
+    pub yolo: bool,
+    #[arg(long, default_value_t = false)]
+    pub dangerously_skip_permissions: bool,
+    #[arg(long, default_value_t = false)]
+    pub sandbox: bool,
+    /// Passed as `--sandbox-network[=true|false]` when set.
+    #[arg(long)]
+    pub sandbox_network: Option<bool>,
+    #[arg(long)]
+    pub shell: Option<String>,
+    #[arg(long)]
+    pub edit_system: Option<String>,
+
+    // ---------- zerostack integrated workflow flags (multi-agent isolation) ----------
+    /// Base directory for worktrees created via `--worktree` (passed through).
+    #[arg(long)]
+    pub wt_base_dir: Option<String>,
+    /// Pass `--wt-force` to zerostack (force worktree remove/branch delete even if dirty).
+    #[arg(long, default_value_t = false)]
+    pub wt_force: bool,
+    /// Pass `--wt-auto-merge` to zerostack.
+    ///
+    /// WARNING: with auto-merge, zerostack merges the worktree branch on exit
+    /// *before* deltastack scores it, bypassing the eval gate. Keep OFF unless
+    /// you know what you are doing; deltastack merges the winner itself.
+    #[arg(long, default_value_t = false)]
+    pub wt_auto_merge: bool,
+    /// Use zerostack `--parallel` (timestamp worktree name + auto-merge) instead of
+    /// deterministic `--worktree <branch-prefix>iter<i>-agent<j>`.
+    /// Note: implies auto-merge semantics; prefer default deterministic mode for eval gating.
+    #[arg(long, default_value_t = false)]
+    pub use_parallel_timestamp: bool,
+    /// Force in-place execution (no `--worktree`/`--parallel` even when agents>1).
+    /// Refused when agents>1 (would make parallel agents clash).
+    #[arg(long, default_value_t = false)]
+    pub no_isolate: bool,
+    /// Prefix for zerostack `--name <prefix>-iter<i>-agent<j>` sessions.
+    #[arg(long, default_value = "deltastack")]
+    pub agent_session_prefix: String,
+    /// Pass `--no-session` (ephemeral zerostack sessions).
+    #[arg(long, default_value_t = false)]
+    pub no_agent_session: bool,
+
+    // ---------- Commit behavior ----------
+    /// Don't append the "git commit when done" suffix to agent prompts.
+    #[arg(long, default_value_t = false)]
+    pub no_auto_commit_prompt: bool,
+    /// Disable fallback `git add -A && git commit` when agent leaves dirty tree.
+    #[arg(long, default_value_t = false)]
+    pub no_auto_commit_fallback: bool,
+
+    // ---------- Output ----------
+    /// JSONL run log path.
+    #[arg(long, default_value = "deltastack.jsonl")]
+    pub state_file: String,
+    /// Directory for per-iteration agent/eval logs.
+    #[arg(long, default_value = "deltastack-logs")]
+    pub log_dir: String,
+    /// Print zerostack + eval commands without running anything.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+    #[arg(short, long, default_value_t = false)]
+    pub quiet: bool,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Mode {
+    /// Higher score is better.
+    Maximize,
+    /// Lower score is better (e.g. val_bpb). Default.
+    #[default]
+    Minimize,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Aggregate {
+    #[default]
+    Mean,
+    Median,
+    Min,
+    Max,
+    First,
+}
+
+impl Cli {
+    /// Effective eval concurrency.
+    pub fn effective_eval_jobs(&self) -> usize {
+        if self.eval_jobs > 0 {
+            return self.eval_jobs as usize;
+        }
+        let total = (self.agents.max(1) * self.samples.max(1)) as usize;
+        total.min(self.samples.max(1) as usize).max(1)
+    }
+
+    /// Validate flag combinations. Called from main before running.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.prompt.is_none() && self.prompt_file.is_none() {
+            anyhow::bail!("one of --prompt or --prompt-file is required");
+        }
+        if self.max_iterations == 0 {
+            anyhow::bail!("--max-iterations must be >= 1");
+        }
+        if self.agents == 0 {
+            anyhow::bail!("--agents must be >= 1");
+        }
+        if self.samples == 0 {
+            anyhow::bail!("--samples must be >= 1");
+        }
+        if !self.min_improvement.is_finite() || self.min_improvement < 0.0 {
+            anyhow::bail!("--min-improvement must be a finite value >= 0");
+        }
+        if let Some(t) = self.temperature {
+            if !(0.0..=2.0).contains(&t) {
+                anyhow::bail!("--temperature must be in 0.0..=2.0");
+            }
+        }
+        if self.no_isolate && self.agents > 1 {
+            anyhow::bail!("--no-isolate cannot be used with --agents > 1 (parallel agents would clash on the same checkout)");
+        }
+        if self.use_parallel_timestamp && self.no_isolate {
+            anyhow::bail!("--use-parallel-timestamp conflicts with --no-isolate");
+        }
+        if self.eval_cmd.trim().is_empty() {
+            anyhow::bail!("--eval must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Whether this iteration setup isolates agents in worktrees.
+    /// Single-agent defaults to in-place; multi-agent defaults to zerostack `--worktree`.
+    pub fn uses_worktree_isolation(&self) -> bool {
+        if self.no_isolate {
+            return false;
+        }
+        self.agents > 1 || self.wt_base_dir.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn base_cli() -> Cli {
+        Cli::parse_from(["deltastack", "--prompt", "hi", "--eval", "echo 1.0"])
+    }
+
+    #[test]
+    fn requires_prompt_or_prompt_file() {
+        let mut c = base_cli();
+        c.prompt = None;
+        c.prompt_file = None;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn prompt_and_prompt_file_conflict_at_clap_level() {
+        let r = Cli::try_parse_from([
+            "deltastack",
+            "--prompt",
+            "a",
+            "--prompt-file",
+            "b",
+            "--eval",
+            "echo 1",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let c = base_cli();
+        assert_eq!(c.max_iterations, 10);
+        assert_eq!(c.agents, 1);
+        assert_eq!(c.samples, 1);
+        assert_eq!(c.mode, Mode::Minimize);
+        assert_eq!(c.aggregate, Aggregate::Mean);
+        assert!(!c.uses_worktree_isolation());
+    }
+
+    #[test]
+    fn multi_agent_enables_worktree_isolation_by_default() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--agents",
+            "4",
+        ]);
+        assert!(c.uses_worktree_isolation());
+    }
+
+    #[test]
+    fn no_isolate_disables_worktrees() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--no-isolate",
+        ]);
+        assert!(!c.uses_worktree_isolation());
+    }
+
+    #[test]
+    fn no_isolate_with_many_agents_is_rejected() {
+        let mut c = base_cli();
+        c.agents = 3;
+        c.no_isolate = true;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn parallel_timestamp_conflicts_with_no_isolate() {
+        let mut c = base_cli();
+        c.no_isolate = true;
+        c.use_parallel_timestamp = true;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_iterations_agents_samples() {
+        for (field, set) in [("max_iterations", 0u32), ("agents", 0), ("samples", 0)] {
+            let mut c = base_cli();
+            match field {
+                "max_iterations" => c.max_iterations = set,
+                "agents" => c.agents = set,
+                _ => c.samples = set,
+            }
+            assert!(c.validate().is_err(), "{field} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_negative_or_nan_min_improvement() {
+        let mut c = base_cli();
+        c.min_improvement = -0.1;
+        assert!(c.validate().is_err());
+        c.min_improvement = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_temperature() {
+        let mut c = base_cli();
+        c.temperature = Some(2.5);
+        assert!(c.validate().is_err());
+        c.temperature = Some(1.5);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn effective_eval_jobs_auto() {
+        let mut c = base_cli();
+        c.agents = 4;
+        c.samples = 3;
+        c.eval_jobs = 0;
+        assert_eq!(c.effective_eval_jobs(), 3);
+        c.eval_jobs = 2;
+        assert_eq!(c.effective_eval_jobs(), 2);
+    }
+
+    #[test]
+    fn tools_repeatable_and_csv() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--tools",
+            "read,write",
+            "--tools",
+            "bash",
+        ]);
+        assert_eq!(c.tools, vec!["read,write", "bash"]);
+    }
+}
