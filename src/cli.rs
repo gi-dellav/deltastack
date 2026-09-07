@@ -227,6 +227,9 @@ pub struct Cli {
     /// JSONL run log path.
     #[arg(long, default_value = "deltastack.jsonl")]
     pub state_file: String,
+    /// CSV run log path (wide, one row per candidate). Unset = disabled.
+    #[arg(long)]
+    pub csv_file: Option<String>,
     /// Directory for per-iteration agent/eval logs.
     #[arg(long, default_value = "deltastack-logs")]
     pub log_dir: String,
@@ -401,6 +404,11 @@ impl Cli {
         if self.no_isolate && self.agents > 1 {
             anyhow::bail!("--no-isolate cannot be used with --agents > 1 (parallel agents would clash on the same checkout)");
         }
+        if let Some(p) = self.csv_file.as_deref() {
+            if p.trim().is_empty() {
+                anyhow::bail!("--csv-file must not be empty");
+            }
+        }
         Ok(())
     }
 
@@ -410,5 +418,15 @@ impl Cli {
     /// worktrees for a single agent.
     pub fn uses_worktree_isolation(&self) -> bool {
         self.agents > 1 && !self.no_isolate
+    }
+
+    /// All deltastack-owned output paths that must never pollute git
+    /// clean-checks or fallback commits (state file + log dir + CSV log).
+    pub fn output_paths(&self) -> Vec<&str> {
+        let mut out = vec![self.state_file.as_str(), self.log_dir.as_str()];
+        if let Some(csv) = self.csv_file.as_deref() {
+            out.push(csv);
+        }
+        out
     }
 }

@@ -548,3 +548,19 @@ pub async fn run_eval_samples_full(
 pub fn successful_scores(samples: &[EvalSample]) -> Vec<f64> {
     samples.iter().filter_map(|s| s.score).collect()
 }
+
+/// True if an eval sample counts as failed: non-zero (or missing) exit code,
+/// a timeout, or an unparsable/missing score.
+///
+/// This is deliberately explicit rather than just `score.is_none()` so the
+/// semantics stay correct if score-producing logic ever changes: exit 0 with
+/// a valid score is the only success case.
+pub fn sample_failed(s: &EvalSample) -> bool {
+    if s.timed_out {
+        return true;
+    }
+    if s.exit_code != Some(0) {
+        return true;
+    }
+    s.score.is_none()
+}

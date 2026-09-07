@@ -115,6 +115,8 @@ pub fn make_config_record(cli: &Cli) -> IterationRecord {
         commit: None,
         worktree: None,
         samples: vec![],
+        exits: vec![],
+        failed: vec![],
         agg: None,
         best: None,
         best_sha: None,

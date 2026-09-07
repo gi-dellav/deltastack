@@ -352,3 +352,24 @@ fn tools_repeatable_and_csv() {
     ]);
     assert_eq!(c.tools, vec!["read,write", "bash"]);
 }
+
+#[test]
+fn csv_file_opt_in_and_validated() {
+    let c = base_cli();
+    assert_eq!(c.csv_file, None);
+    assert!(c.validate().is_ok());
+    let c = Cli::parse_from([
+        "deltastack",
+        "--prompt",
+        "x",
+        "--eval",
+        "echo 1",
+        "--csv-file",
+        "run.csv",
+    ]);
+    assert_eq!(c.csv_file.as_deref(), Some("run.csv"));
+    assert!(c.validate().is_ok());
+    let mut c = base_cli();
+    c.csv_file = Some("  ".into());
+    assert!(c.validate().is_err());
+}

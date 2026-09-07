@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod csv_log;
 mod eval;
 mod git;
 mod orchestrator;
@@ -102,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if !cli.allow_dirty && !git::is_clean_filtered(&repo, &cli.state_file, &cli.log_dir).await? {
+    if !cli.allow_dirty
+        && !git::is_clean_filtered_extra(&repo, &cli.output_paths()).await?
+    {
         anyhow::bail!("git tree is dirty; commit/stash first or pass --allow-dirty");
     }
     if cli.wt_auto_merge && cli.uses_worktree_isolation() {
@@ -165,29 +168,29 @@ async fn main() -> anyhow::Result<()> {
                     eval_retry_delay,
                 )
                 .await;
-                let baseline_scores: Vec<Option<f64>> =
-                    baseline_samples.iter().map(|s| s.score).collect();
+                let (baseline_scores, baseline_exits, baseline_failed) =
+                    state::IterationRecord::sample_columns(&baseline_samples);
                 let b = orchestrator::score_candidate(&baseline_samples, cli.aggregate);
                 info!("baseline samples={baseline_scores:?} agg={b:?}");
 
-                state::append_record(
-                    &cli.state_file,
-                    &state::IterationRecord {
-                        iteration: 0,
-                        agent_idx: 0,
-                        kind: state::RecordKind::Baseline,
-                        commit: Some(baseline_sha.clone()),
-                        worktree: None,
-                        samples: baseline_scores,
-                        agg: b,
-                        best: b,
-                        best_sha: Some(baseline_sha.clone()),
-                        decision: Some("baseline".into()),
-                        agent_exit: None,
-                        note: None,
-                    },
-                )
-                .await?;
+                let baseline_rec = state::IterationRecord {
+                    iteration: 0,
+                    agent_idx: 0,
+                    kind: state::RecordKind::Baseline,
+                    commit: Some(baseline_sha.clone()),
+                    worktree: None,
+                    samples: baseline_scores,
+                    exits: baseline_exits,
+                    failed: baseline_failed,
+                    agg: b,
+                    best: b,
+                    best_sha: Some(baseline_sha.clone()),
+                    decision: Some("baseline".into()),
+                    agent_exit: None,
+                    note: None,
+                };
+                state::append_record(&cli.state_file, &baseline_rec).await?;
+                maybe_append_csv(&cli, &baseline_rec).await?;
                 (b, baseline_sha, 0, b, 0, 1)
             }
         };
@@ -329,24 +332,25 @@ async fn main() -> anyhow::Result<()> {
         for o in &outcomes {
             let is_winner = winner.map(|w| w.agent_idx == o.agent_idx).unwrap_or(false);
             let decision = if is_winner { decision_global } else { "revert" };
-            state::append_record(
-                &cli.state_file,
-                &state::IterationRecord::candidate(
-                    iter,
-                    o.agent_idx,
-                    o.commit.clone(),
-                    o.worktree_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string()),
-                    o.samples.iter().map(|s| s.score).collect(),
-                    o.agg,
-                    iter_best,
-                    Some(best_sha.clone()),
-                    decision,
-                    o.agent_exit,
-                ),
-            )
-            .await?;
+            let (scores, exits, failed) = state::IterationRecord::sample_columns(&o.samples);
+            let rec = state::IterationRecord::candidate(
+                iter,
+                o.agent_idx,
+                o.commit.clone(),
+                o.worktree_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                scores,
+                exits,
+                failed,
+                o.agg,
+                iter_best,
+                Some(best_sha.clone()),
+                decision,
+                o.agent_exit,
+            );
+            state::append_record(&cli.state_file, &rec).await?;
+            maybe_append_csv(&cli, &rec).await?;
             if cli.uses_worktree_isolation() && !cli.keep_worktrees {
                 if let Some(p) = &o.worktree_path {
                     let _ = git::remove_worktree(&repo, p, cli.wt_force).await;
@@ -549,7 +553,7 @@ async fn resolve_agent_worktree(
 }
 
 /// If the agent committed, return new HEAD; if dirty and fallback allowed, commit; else current HEAD/None.
-/// Ignores deltastack's own state file + log dir so logs never trigger commits.
+/// Ignores deltastack's own outputs (state file + log dir + CSV log) so logs never trigger commits.
 async fn normalize_commit(
     exec_dir: &Path,
     cli: &Cli,
@@ -557,7 +561,7 @@ async fn normalize_commit(
     agent_idx: u32,
 ) -> anyhow::Result<Option<String>> {
     let head = git::current_sha(exec_dir).await.ok();
-    let clean = git::is_clean_filtered(exec_dir, &cli.state_file, &cli.log_dir)
+    let clean = git::is_clean_filtered_extra(exec_dir, &cli.output_paths())
         .await
         .unwrap_or(true);
     if !clean && !cli.no_auto_commit_fallback {
@@ -566,10 +570,18 @@ async fn normalize_commit(
             cli.branch_prefix, iteration, agent_idx
         );
         let sha =
-            git::fallback_commit_filtered(exec_dir, &msg, &cli.state_file, &cli.log_dir).await?;
+            git::fallback_commit_filtered_extra(exec_dir, &msg, &cli.output_paths()).await?;
         return Ok(Some(sha));
     }
     Ok(head)
+}
+
+/// Append one CSV row when `--csv-file` is set; no-op otherwise.
+async fn maybe_append_csv(cli: &Cli, rec: &state::IterationRecord) -> anyhow::Result<()> {
+    if let Some(path) = cli.csv_file.as_deref() {
+        csv_log::append_csv_record(path, rec, cli.samples as usize).await?;
+    }
+    Ok(())
 }
 
 fn eval_timeout(cli: &Cli) -> Duration {
@@ -735,7 +747,7 @@ fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result
         }
     }
     println!(
-        "\nmode={:?} aggregate={:?} agents={} samples={} isolation={} retries={} wall_time={}s iter_delay={}s eval_delay={}s rel_eps={} sticky={}",
+        "\nmode={:?} aggregate={:?} agents={} samples={} isolation={} retries={} wall_time={}s iter_delay={}s eval_delay={}s rel_eps={} sticky={} csv={}",
         cli.mode,
         cli.aggregate,
         cli.agents,
@@ -747,6 +759,7 @@ fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result
         cli.delay_between_eval,
         cli.min_improvement_rel,
         cli.target_sticky,
+        cli.csv_file.as_deref().unwrap_or("(disabled)"),
     );
     Ok(())
 }

@@ -58,9 +58,15 @@ pub fn find_worktree_for_branch(
 /// Compute repo-relative ignore prefixes for deltastack's own outputs
 /// (state file + log dir) so they never pollute clean-checks or commits.
 /// Absolute paths outside the repo yield no ignores.
+#[allow(dead_code)] // legacy helper; filtered `_extra` variants preferred. Used in tests.
 pub fn output_ignores(repo: &Path, state_file: &str, log_dir: &str) -> Vec<String> {
+    output_ignores_extra(repo, &[state_file, log_dir])
+}
+
+/// Same as `output_ignores` plus extra output paths (e.g. the CSV log).
+pub fn output_ignores_extra(repo: &Path, raw_paths: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
-    for raw in [state_file, log_dir] {
+    for raw in raw_paths {
         let p = Path::new(raw);
         let abs = if p.is_absolute() {
             p.to_path_buf()
@@ -150,14 +156,21 @@ pub async fn is_clean(repo: &Path) -> anyhow::Result<bool> {
     Ok(porcelain_status(repo).await?.trim().is_empty())
 }
 
-/// Like `is_clean` but ignores deltastack's own state file + log dir.
+/// Like `is_clean` but ignores deltastack's own state file + log dir
+/// (plus optional extra output paths such as the CSV log).
+#[allow(dead_code)] // legacy helper; `_extra` variant preferred in binary. Used in tests.
 pub async fn is_clean_filtered(
     repo: &Path,
     state_file: &str,
     log_dir: &str,
 ) -> anyhow::Result<bool> {
+    is_clean_filtered_extra(repo, &[state_file, log_dir]).await
+}
+
+/// `is_clean_filtered` with extra ignored output paths.
+pub async fn is_clean_filtered_extra(repo: &Path, outputs: &[&str]) -> anyhow::Result<bool> {
     let raw = porcelain_status(repo).await?;
-    let ignores = output_ignores(repo, state_file, log_dir);
+    let ignores = output_ignores_extra(repo, outputs);
     Ok(filter_porcelain(&raw, &ignores).trim().is_empty())
 }
 
@@ -233,14 +246,25 @@ pub async fn reset_hard(repo: &Path, sha: &str) -> anyhow::Result<()> {
 }
 
 /// Fallback commit when the agent left a dirty tree but no commit.
-/// Stages everything EXCEPT deltastack's own state file + log dir.
+/// Stages everything EXCEPT deltastack's own state file + log dir
+/// (plus optional extra output paths such as the CSV log).
+#[allow(dead_code)] // legacy helper; `_extra` variant preferred in binary. Used in tests.
 pub async fn fallback_commit_filtered(
     repo: &Path,
     message: &str,
     state_file: &str,
     log_dir: &str,
 ) -> anyhow::Result<String> {
-    let ignores = output_ignores(repo, state_file, log_dir);
+    fallback_commit_filtered_extra(repo, message, &[state_file, log_dir]).await
+}
+
+/// `fallback_commit_filtered` with extra ignored output paths.
+pub async fn fallback_commit_filtered_extra(
+    repo: &Path,
+    message: &str,
+    outputs: &[&str],
+) -> anyhow::Result<String> {
+    let ignores = output_ignores_extra(repo, outputs);
     // Stage all, then unstage our own outputs (simpler than pathspec negation across git versions).
     let out = git(repo, &["add", "-A"]).await?;
     if !out.status.success() {

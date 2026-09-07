@@ -124,6 +124,27 @@ fn successful_scores_filters_failures() {
     assert_eq!(successful_scores(&samples), vec![1.0, 2.0]);
 }
 
+#[test]
+fn sample_failed_semantics() {
+    let mk = |score: Option<f64>, exit_code: Option<i32>, timed_out: bool| EvalSample {
+        score,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code,
+        timed_out,
+    };
+    // Only exit-0 + valid score succeeds.
+    assert!(!sample_failed(&mk(Some(1.0), Some(0), false)));
+    // Parse failure with exit 0 is still failed.
+    assert!(sample_failed(&mk(None, Some(0), false)));
+    // Non-zero exit is failed even if a score somehow exists.
+    assert!(sample_failed(&mk(Some(1.0), Some(1), false)));
+    assert!(sample_failed(&mk(None, Some(1), false)));
+    // Timeout and spawn failure are failed.
+    assert!(sample_failed(&mk(None, Some(0), true)));
+    assert!(sample_failed(&mk(None, None, false)));
+}
+
 #[tokio::test]
 async fn run_eval_once_echo_float() {
     let dir = tempfile::tempdir().unwrap();
