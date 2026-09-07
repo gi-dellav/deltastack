@@ -5,6 +5,8 @@ mod git;
 mod orchestrator;
 mod prompt;
 mod state;
+#[cfg(test)]
+mod tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -569,7 +571,9 @@ fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result
     match kind {
         cli::EvalKind::Custom(cmd) => println!("\neval:\nsh -c {cmd:?}"),
         cli::EvalKind::Speed(cmd) => {
-            println!("\noptimize-speed:\nsh -c {cmd:?}\nscore = wall-clock seconds (lower is better)");
+            println!(
+                "\noptimize-speed:\nsh -c {cmd:?}\nscore = wall-clock seconds (lower is better)"
+            );
         }
         cli::EvalKind::Memory(cmd) => {
             println!(
