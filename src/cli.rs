@@ -8,24 +8,34 @@ use clap::{Parser, ValueEnum};
 #[command(name = "deltastack", version, about)]
 pub struct Cli {
     // ---------- Task definition ----------
-    /// Inline task prompt (conflicts with --prompt-file).
+    /// Inline task prompt.
+    ///
+    /// Conflicts with --prompt-file.
     #[arg(short, long, conflicts_with = "prompt_file")]
     pub prompt: Option<String>,
 
     /// Read task prompt from file.
+    ///
+    /// Conflicts with --prompt.
     #[arg(long, conflicts_with = "prompt")]
     pub prompt_file: Option<String>,
 
-    /// Eval shell command (run via `sh -c`). Stdout must be a single float.
+    /// Eval shell command.
+    ///
+    /// Run via `sh -c`. Stdout must be a single float.
     #[arg(short, long = "eval", conflicts_with_all = ["optimize_speed", "optimize_memory"])]
     pub eval_cmd: Option<String>,
 
-    /// Optimize wall-clock time of CMD (run via `sh -c`). Score = seconds (lower is better).
+    /// Optimize wall-clock time of CMD.
+    ///
+    /// Run via `sh -c`. Score = seconds (lower is better).
     /// Replaces --eval; provides a default prompt (override with --prompt/--prompt-file).
     #[arg(long, value_name = "CMD", conflicts_with_all = ["eval_cmd", "optimize_memory"])]
     pub optimize_speed: Option<String>,
 
-    /// Optimize peak memory of CMD (run via `sh -c` under GNU `time -v`).
+    /// Optimize peak memory of CMD.
+    ///
+    /// Run via `sh -c` under GNU `time -v`.
     /// Score = peak RSS in kilobytes (lower is better). Replaces --eval;
     /// provides a default prompt (override with --prompt/--prompt-file).
     #[arg(long, value_name = "CMD", conflicts_with_all = ["eval_cmd", "optimize_speed"])]
@@ -40,7 +50,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 10)]
     pub max_iterations: u32,
 
-    /// Concurrent agents per iteration (each runs in its own worktree via zerostack's integrated --worktree flag).
+    /// Concurrent agents per iteration.
+    ///
+    /// Each runs in its own worktree via zerostack's integrated --worktree flag.
     #[arg(long, default_value_t = 1)]
     pub agents: u32,
 
@@ -48,175 +60,224 @@ pub struct Cli {
     #[arg(long, default_value_t = 1)]
     pub samples: u32,
 
-    /// Concurrent eval processes. 0 = auto (min(samples, agents*samples)).
+    /// Concurrent eval processes.
+    ///
+    /// 0 = auto (min(samples, agents*samples)).
     #[arg(long, default_value_t = 0)]
     pub eval_jobs: u32,
 
-    /// How to aggregate multiple samples into one score.
+    /// How to aggregate samples into one score.
     #[arg(long, value_enum, default_value_t = Aggregate::Mean)]
     pub aggregate: Aggregate,
 
-    /// Whether higher or lower eval scores are better.
+    /// Higher or lower scores are better.
     #[arg(long, value_enum, default_value_t = Mode::Minimize)]
     pub mode: Mode,
 
-    /// Minimum improvement over global best to count as `keep`.
+    /// Minimum improvement to count as `keep`.
+    ///
+    /// Over global best.
     #[arg(long, default_value_t = 0.0)]
     pub min_improvement: f64,
 
-    /// Minimum relative improvement over global best to count as `keep`
-    /// (fraction, e.g. 0.01 = 1%). Combined with --min-improvement:
+    /// Minimum relative improvement to count as `keep`.
+    ///
+    /// Fraction, e.g. 0.01 = 1%. Combined with --min-improvement:
     /// candidate must satisfy BOTH when both are non-zero. Relative is
     /// computed against |best| (falls back to absolute-only when best == 0).
     #[arg(long, default_value_t = 0.0)]
     pub min_improvement_rel: f64,
 
-    /// Stop after N consecutive iterations without improvement (0 = disabled).
+    /// Stop after N iters without improvement.
+    ///
+    /// 0 = disabled.
     #[arg(long, default_value_t = 0)]
     pub patience: u32,
 
-    /// Early-stop once this score is reached/exceeded (mode-aware).
+    /// Early-stop once this score is reached.
+    ///
+    /// Mode-aware.
     #[arg(long)]
     pub target: Option<f64>,
 
+    /// Sticky target threshold.
+    ///
     /// Target must be reached N consecutive iterations before stopping (default 1).
     /// Only meaningful with --target; higher values guard against lucky samples.
     #[arg(long, default_value_t = 1)]
     pub target_sticky: u32,
 
-    /// Timeout per agent run in seconds (0 = none).
+    /// Timeout per agent run in seconds.
+    ///
+    /// 0 = none.
     #[arg(long, default_value_t = 0)]
     pub agent_timeout: u64,
 
-    /// Timeout per single eval run in seconds (0 = none).
+    /// Timeout per single eval run in seconds.
+    ///
+    /// 0 = none.
     #[arg(long, default_value_t = 600)]
     pub eval_timeout: u64,
 
-    /// Additional retries per failed eval (score parse or non-zero exit).
-    /// Total attempts per sample = 1 + retries.
+    /// Additional retries per failed eval.
+    ///
+    /// Score parse or non-zero exit. Total attempts per sample = 1 + retries.
     #[arg(long, default_value_t = 0)]
     pub eval_retries: u32,
 
-    /// Delay between eval invocations in seconds (0 = none).
-    /// Applied between retry attempts and staggered between samples.
+    /// Delay between eval invocations in seconds.
+    ///
+    /// 0 = none. Applied between retry attempts and staggered between samples.
     #[arg(long, default_value_t = 0)]
     pub delay_between_eval: u64,
 
-    /// Max total wall-clock time for the whole run in seconds (0 = none).
-    /// Checked between iterations; the current iteration is allowed to finish.
+    /// Max total wall-clock time in seconds.
+    ///
+    /// 0 = none. Checked between iterations; the current iteration is allowed to finish.
     #[arg(long, default_value_t = 0)]
     pub max_wall_time: u64,
 
-    /// Delay between outer-loop iterations in seconds (0 = none).
+    /// Delay between outer-loop iterations in seconds.
+    ///
+    /// 0 = none.
     #[arg(long, default_value_t = 0)]
     pub delay_between_iterations: u64,
 
-    /// Disable git auto-revert on non-improving iterations.
+    /// Disable git auto-revert.
+    ///
+    /// On non-improving iterations.
     #[arg(long, default_value_t = false)]
     pub no_revert: bool,
 
-    /// Allow starting with a dirty git tree (default: require clean).
+    /// Allow dirty git tree at start.
+    ///
+    /// Default: require clean.
     #[arg(long, default_value_t = false)]
     pub allow_dirty: bool,
 
-    /// Branch prefix for per-agent worktree branches.
+    /// Branch prefix for agent worktrees.
     #[arg(long, default_value = "deltastack/")]
     pub branch_prefix: String,
 
-    /// Keep failed/candidate worktrees for debugging (default: remove).
+    /// Keep failed/candidate worktrees.
+    ///
+    /// For debugging (default: remove).
     #[arg(long, default_value_t = false)]
     pub keep_worktrees: bool,
 
     // ---------- zerostack agent passthrough (explicit subset) ----------
-    /// set-up model and providers used
+    /// Provider for agent.
     #[arg(long)]
     pub provider: Option<String>,
-    /// set-up model and providers used
+    /// Model for agent.
     #[arg(long)]
     pub model: Option<String>,
-    /// set-up model from a set of configured provider-model combinations
+    /// Quick model preset.
+    ///
+    /// From configured provider-model combinations.
     #[arg(long)]
     pub quick_model: Option<String>,
-    /// max tokens for the model response
+    /// Max response tokens.
     #[arg(long)]
     pub max_tokens: Option<u32>,
-    /// max turns for the coding agent
+    /// Max agent turns.
     #[arg(long)]
     pub max_agent_turns: Option<u32>,
-    /// sampling temperature for the model
+    /// Sampling temperature.
     #[arg(long, allow_hyphen_values = true)]
     pub temperature: Option<f64>,
-    /// minimum sampling temperature for randomly generated temperatures
-    /// (requires --temperature-max; per-agent uniform random in [min, max]).
+    /// Min random temperature.
+    ///
+    /// Requires --temperature-max; per-agent uniform random in [min, max].
     #[arg(long, allow_hyphen_values = true)]
     pub temperature_min: Option<f64>,
-    /// maximum sampling temperature for randomly generated temperatures
-    /// (requires --temperature-min; per-agent uniform random in [min, max]).
+    /// Max random temperature.
+    ///
+    /// Requires --temperature-min; per-agent uniform random in [min, max].
     #[arg(long, allow_hyphen_values = true)]
     pub temperature_max: Option<f64>,
-    /// per-iteration temperature step: real_temp = base + step * current_step,
-    /// with current_step = iteration starting at 1. Base is the random
-    /// temperature when --temperature-min/--temperature-max are set,
-    /// otherwise --temperature. Requires a base temperature.
+    /// Per-iteration temperature step.
+    ///
+    /// real_temp = base + step * current_step, with current_step = iteration
+    /// starting at 1. Base is the random temperature when
+    /// --temperature-min/--temperature-max are set, otherwise --temperature.
+    /// Requires a base temperature.
     #[arg(long, allow_hyphen_values = true)]
     pub temperature_step: Option<f64>,
-    /// Allowlisted tools, comma-separated; repeatable. Passed as `--tools <CSV>`.
+    /// Allowlisted tools, comma-separated.
+    ///
+    /// Repeatable. Passed as `--tools <CSV>`.
     #[arg(short, long = "tools")]
     pub tools: Vec<String>,
-    /// don't load AGENTS.md and similar files
+    /// Don't load AGENTS.md files.
     #[arg(long, default_value_t = false)]
     pub no_context_files: bool,
-    /// auto-accept all agent actions
+    /// Auto-accept agent actions.
     #[arg(long, default_value_t = false)]
     pub accept_all: bool,
-    /// run agent in yolo mode (auto-approve everything)
+    /// Yolo mode (auto-approve everything).
     #[arg(long, default_value_t = false)]
     pub yolo: bool,
-    /// skip all permission checks (dangerous)
+    /// Skip permission checks (dangerous).
     #[arg(long, default_value_t = false)]
     pub dangerously_skip_permissions: bool,
-    /// run the coding agent in a sandbox
+    /// Run agent in a sandbox.
     #[arg(long, default_value_t = false)]
     pub sandbox: bool,
     /// Passed as `--sandbox-network[=true|false]` when set.
     #[arg(long)]
     pub sandbox_network: Option<bool>,
-    /// shell binary used by the coding agent
+    /// Shell binary for agent.
     #[arg(long)]
     pub shell: Option<String>,
 
     // ---------- zerostack integrated workflow flags (multi-agent isolation) ----------
-    /// Base directory for worktrees (only used with --agents > 1; passed through as --wt-base-dir).
+    /// Base directory for worktrees.
+    ///
+    /// Only used with --agents > 1; passed through as --wt-base-dir.
     #[arg(long)]
     pub wt_base_dir: Option<String>,
-    /// Pass `--wt-force` to zerostack (force worktree remove/branch delete even if dirty).
+    /// Pass `--wt-force` to zerostack.
+    ///
+    /// Force worktree remove/branch delete even if dirty.
     #[arg(long, default_value_t = false)]
     pub wt_force: bool,
-    /// Pass `--wt-auto-merge` to zerostack. WARNING: merges worktree branch on exit before deltastack scores it, bypassing the eval gate. Keep OFF.
+    /// Pass `--wt-auto-merge` to zerostack.
+    ///
+    /// WARNING: merges worktree branch on exit before deltastack scores it,
+    /// bypassing the eval gate. Keep OFF.
     #[arg(long, default_value_t = false)]
     pub wt_auto_merge: bool,
-    /// Force in-place execution. Single-agent runs are always in-place, so this
-    /// is a no-op there; refused with --agents > 1 (parallel agents would clash
-    /// on the same checkout).
+    /// Force in-place execution.
+    ///
+    /// Single-agent runs are always in-place, so this is a no-op there;
+    /// refused with --agents > 1 (parallel agents would clash on the same checkout).
     #[arg(long, default_value_t = false)]
     pub no_isolate: bool,
-    /// Prefix for zerostack `--name <prefix>-iter<i>-agent<j>` sessions (only with --keep-agent-session).
+    /// Prefix for zerostack session names.
+    ///
+    /// `--name <prefix>-iter<i>-agent<j>` (only with --keep-agent-session).
     #[arg(long, default_value = "deltastack")]
     pub agent_session_prefix: String,
-    /// Keep zerostack agent sessions (pass `--name`); default is ephemeral (`--no-session`).
+    /// Keep zerostack agent sessions.
+    ///
+    /// Pass `--name`; default is ephemeral (`--no-session`).
     #[arg(long, default_value_t = false)]
     pub keep_agent_session: bool,
 
     // ---------- Commit behavior ----------
-    /// Don't append the "git commit when done" suffix to agent prompts.
+    /// Don't append auto-commit suffix to prompts.
     #[arg(long, default_value_t = false)]
     pub no_auto_commit_prompt: bool,
-    /// Disable fallback `git add -A && git commit` when agent leaves dirty tree.
+    /// Disable fallback auto-commit.
+    ///
+    /// `git add -A && git commit` when agent leaves dirty tree.
     #[arg(long, default_value_t = false)]
     pub no_auto_commit_fallback: bool,
 
     // ---------- Resume ----------
-    /// Resume from an existing state file instead of starting fresh.
+    /// Resume from an existing state file.
+    ///
     /// Continues at the first incomplete iteration, resets the checkout to
     /// the saved best commit, and skips re-running the baseline eval.
     /// The trailing partial iteration (if any) is discarded and re-run.
@@ -227,19 +288,23 @@ pub struct Cli {
     /// JSONL run log path.
     #[arg(long, default_value = "deltastack.jsonl")]
     pub state_file: String,
-    /// CSV run log path (wide, one row per candidate). Unset = disabled.
+    /// CSV run log path.
+    ///
+    /// Wide, one row per candidate. Unset = disabled.
     #[arg(long)]
     pub csv_file: Option<String>,
-    /// Directory for per-iteration agent/eval logs.
+    /// Directory for agent/eval logs.
     #[arg(long, default_value = "deltastack-logs")]
     pub log_dir: String,
-    /// Print zerostack + eval commands without running anything.
+    /// Print commands without running anything.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
     /// Verbose output.
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
-    /// Quiet output (warnings only).
+    /// Quiet output.
+    ///
+    /// Warnings only.
     #[arg(short, long, default_value_t = false)]
     pub quiet: bool,
 }
