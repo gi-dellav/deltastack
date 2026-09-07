@@ -70,6 +70,18 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&cli.log_dir).await?;
 
+    let run_start = std::time::Instant::now();
+    let wall_budget = if cli.max_wall_time == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(cli.max_wall_time)
+    };
+    let eval_retry_delay = if cli.delay_between_eval == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(cli.delay_between_eval)
+    };
+
     // ---- baseline ----
     let baseline_sha = git::current_sha(&repo).await?;
     info!("baseline commit {baseline_sha}");
@@ -82,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
         Some(PathBuf::from(&cli.log_dir)),
         0,
         99,
+        cli.eval_retries,
+        eval_retry_delay,
     )
     .await;
     let baseline_scores: Vec<Option<f64>> = baseline_samples.iter().map(|s| s.score).collect();
@@ -110,8 +124,17 @@ async fn main() -> anyhow::Result<()> {
 
     let mut fails_since_best: u32 = 0;
     let mut last_score = best;
+    let mut target_hits: u32 = 0;
 
     for iter in 1..=cli.max_iterations {
+        if orchestrator::wall_time_exceeded(run_start.elapsed(), cli.max_wall_time) {
+            info!(
+                "stopping: wall-time budget {}s exceeded after {} iterations",
+                cli.max_wall_time,
+                iter - 1
+            );
+            break;
+        }
         info!(
             "=== iteration {iter}/{} (agents={}) ===",
             cli.max_iterations, cli.agents
@@ -191,9 +214,13 @@ async fn main() -> anyhow::Result<()> {
         if let Some(w) = winner {
             if let Some(score) = w.agg {
                 let improves = match best {
-                    Some(b) => {
-                        orchestrator::is_improvement(score, b, cli.mode, cli.min_improvement)
-                    }
+                    Some(b) => orchestrator::is_improvement_full(
+                        score,
+                        b,
+                        cli.mode,
+                        cli.min_improvement,
+                        cli.min_improvement_rel,
+                    ),
                     None => true, // no baseline (all failed) -> first score wins
                 };
                 if improves {
@@ -267,20 +294,40 @@ async fn main() -> anyhow::Result<()> {
 
         info!("iter {iter}: best={best:?} ({best_sha}) fails_since_best={fails_since_best}");
 
-        match orchestrator::should_stop(
+        // Sticky target: count consecutive iterations whose winner hit the target.
+        let winner_score = winner.and_then(|w| w.agg);
+        if let (Some(s), Some(t)) = (winner_score, cli.target) {
+            if orchestrator::reached_target(s, t, cli.mode) {
+                target_hits += 1;
+            } else {
+                target_hits = 0;
+            }
+        } else {
+            target_hits = 0;
+        }
+
+        match orchestrator::should_stop_full(
             iter,
             cli.max_iterations,
             fails_since_best,
             cli.patience,
-            winner.and_then(|w| w.agg),
+            winner_score,
             cli.target,
             cli.mode,
+            cli.target_sticky,
+            target_hits.saturating_sub(1),
+            Some(run_start.elapsed()),
+            Some(wall_budget),
         ) {
             orchestrator::StopReason::Continue => {}
             r => {
                 info!("stopping: {r:?}");
                 break;
             }
+        }
+
+        if iter < cli.max_iterations && cli.delay_between_iterations > 0 {
+            tokio::time::sleep(Duration::from_secs(cli.delay_between_iterations)).await;
         }
     }
 
@@ -373,6 +420,12 @@ async fn run_single_agent(
         Some(log_dir.to_path_buf()),
         iteration,
         agent_idx,
+        cli.eval_retries,
+        if cli.delay_between_eval == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(cli.delay_between_eval)
+        },
     )
     .await;
     let agg = orchestrator::score_candidate(&samples, cli.aggregate);
@@ -457,15 +510,39 @@ async fn run_eval_for_kind(
     log_dir: Option<PathBuf>,
     iter: u32,
     agent_idx: u32,
+    retries: u32,
+    delay_between: Duration,
 ) -> Vec<eval::EvalSample> {
     match kind {
         cli::EvalKind::Custom(cmd) => {
-            eval::run_eval_samples(cmd, workdir, samples, jobs, timeout, log_dir, iter, agent_idx)
-                .await
+            eval::run_eval_samples_full(
+                cmd,
+                workdir,
+                samples,
+                jobs,
+                timeout,
+                log_dir,
+                iter,
+                agent_idx,
+                retries,
+                delay_between,
+            )
+            .await
         }
         _ => {
-            eval::run_optimize_samples(kind, workdir, samples, jobs, timeout, log_dir, iter, agent_idx)
-                .await
+            eval::run_optimize_samples_full(
+                kind,
+                workdir,
+                samples,
+                jobs,
+                timeout,
+                log_dir,
+                iter,
+                agent_idx,
+                retries,
+                delay_between,
+            )
+            .await
         }
     }
 }
@@ -502,12 +579,18 @@ fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result
         }
     }
     println!(
-        "\nmode={:?} aggregate={:?} agents={} samples={} isolation={}",
+        "\nmode={:?} aggregate={:?} agents={} samples={} isolation={} retries={} wall_time={}s iter_delay={}s eval_delay={}s rel_eps={} sticky={}",
         cli.mode,
         cli.aggregate,
         cli.agents,
         cli.samples,
-        cli.uses_worktree_isolation()
+        cli.uses_worktree_isolation(),
+        cli.eval_retries,
+        cli.max_wall_time,
+        cli.delay_between_iterations,
+        cli.delay_between_eval,
+        cli.min_improvement_rel,
+        cli.target_sticky,
     );
     Ok(())
 }

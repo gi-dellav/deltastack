@@ -64,6 +64,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0)]
     pub min_improvement: f64,
 
+    /// Minimum relative improvement over global best to count as `keep`
+    /// (fraction, e.g. 0.01 = 1%). Combined with --min-improvement:
+    /// candidate must satisfy BOTH when both are non-zero. Relative is
+    /// computed against |best| (falls back to absolute-only when best == 0).
+    #[arg(long, default_value_t = 0.0)]
+    pub min_improvement_rel: f64,
+
     /// Stop after N consecutive iterations without improvement (0 = disabled).
     #[arg(long, default_value_t = 0)]
     pub patience: u32,
@@ -72,6 +79,11 @@ pub struct Cli {
     #[arg(long)]
     pub target: Option<f64>,
 
+    /// Target must be reached N consecutive iterations before stopping (default 1).
+    /// Only meaningful with --target; higher values guard against lucky samples.
+    #[arg(long, default_value_t = 1)]
+    pub target_sticky: u32,
+
     /// Timeout per agent run in seconds (0 = none).
     #[arg(long, default_value_t = 0)]
     pub agent_timeout: u64,
@@ -79,6 +91,25 @@ pub struct Cli {
     /// Timeout per single eval run in seconds (0 = none).
     #[arg(long, default_value_t = 600)]
     pub eval_timeout: u64,
+
+    /// Additional retries per failed eval (score parse or non-zero exit).
+    /// Total attempts per sample = 1 + retries.
+    #[arg(long, default_value_t = 0)]
+    pub eval_retries: u32,
+
+    /// Delay between eval invocations in seconds (0 = none).
+    /// Applied between retry attempts and staggered between samples.
+    #[arg(long, default_value_t = 0)]
+    pub delay_between_eval: u64,
+
+    /// Max total wall-clock time for the whole run in seconds (0 = none).
+    /// Checked between iterations; the current iteration is allowed to finish.
+    #[arg(long, default_value_t = 0)]
+    pub max_wall_time: u64,
+
+    /// Delay between outer-loop iterations in seconds (0 = none).
+    #[arg(long, default_value_t = 0)]
+    pub delay_between_iterations: u64,
 
     /// Disable git auto-revert on non-improving iterations.
     #[arg(long, default_value_t = false)]
@@ -305,6 +336,12 @@ impl Cli {
         }
         if !self.min_improvement.is_finite() || self.min_improvement < 0.0 {
             anyhow::bail!("--min-improvement must be a finite value >= 0");
+        }
+        if !self.min_improvement_rel.is_finite() || self.min_improvement_rel < 0.0 {
+            anyhow::bail!("--min-improvement-rel must be a finite value >= 0");
+        }
+        if self.target_sticky == 0 {
+            anyhow::bail!("--target-sticky must be >= 1");
         }
         // All temperature flags accept any finite f64 (positive or negative).
         if let Some(t) = self.temperature {
@@ -550,6 +587,59 @@ mod tests {
         assert!(c.validate().is_err());
         c.min_improvement = f64::NAN;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_negative_or_nan_min_improvement_rel() {
+        let mut c = base_cli();
+        c.min_improvement_rel = -0.01;
+        assert!(c.validate().is_err());
+        c.min_improvement_rel = f64::NAN;
+        assert!(c.validate().is_err());
+        c.min_improvement_rel = 0.01;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_target_sticky() {
+        let mut c = base_cli();
+        c.target_sticky = 0;
+        assert!(c.validate().is_err());
+        c.target_sticky = 3;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn new_loop_flags_parse() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--eval-retries",
+            "2",
+            "--max-wall-time",
+            "3600",
+            "--min-improvement-rel",
+            "0.01",
+            "--target",
+            "0.5",
+            "--target-sticky",
+            "3",
+            "--delay-between-iterations",
+            "5",
+            "--delay-between-eval",
+            "1",
+        ]);
+        assert_eq!(c.eval_retries, 2);
+        assert_eq!(c.max_wall_time, 3600);
+        assert_eq!(c.min_improvement_rel, 0.01);
+        assert_eq!(c.target, Some(0.5));
+        assert_eq!(c.target_sticky, 3);
+        assert_eq!(c.delay_between_iterations, 5);
+        assert_eq!(c.delay_between_eval, 1);
+        assert!(c.validate().is_ok());
     }
 
     #[test]

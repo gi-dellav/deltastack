@@ -280,6 +280,30 @@ pub async fn run_eval_once(
     }
 }
 
+/// Run the eval command once in `workdir`, retrying failures up to `retries` times.
+/// A run is retried when it yields no score (non-zero exit, parse failure,
+/// timeout, or spawn error). `delay_between` is slept between attempts.
+/// Returns the last attempt's sample.
+pub async fn run_eval_once_with_retries(
+    eval_cmd: &str,
+    workdir: &Path,
+    timeout: Duration,
+    log_file: Option<&Path>,
+    retries: u32,
+    delay_between: Duration,
+) -> EvalSample {
+    let mut sample = run_eval_once(eval_cmd, workdir, timeout, log_file).await;
+    for _ in 0..retries {
+        if sample.score.is_some() {
+            break;
+        }
+        if !delay_between.is_zero() {
+            tokio::time::sleep(delay_between).await;
+        }
+        sample = run_eval_once(eval_cmd, workdir, timeout, log_file).await;
+    }
+    sample
+}
 async fn write_eval_log(
     path: &Path,
     eval_cmd: &str,
@@ -317,6 +341,7 @@ pub async fn check_gnu_time_available() -> anyhow::Result<String> {
 
 /// Run `samples` speed/memory evals with bounded concurrency; returns per-sample results in order.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy wrapper; full variant preferred in binary. Used in tests.
 pub async fn run_optimize_samples(
     kind: &crate::cli::EvalKind,
     workdir: PathBuf,
@@ -326,6 +351,26 @@ pub async fn run_optimize_samples(
     log_dir: Option<PathBuf>,
     iter: u32,
     agent_idx: u32,
+) -> Vec<EvalSample> {
+    run_optimize_samples_full(
+        kind, workdir, samples, jobs, timeout, log_dir, iter, agent_idx, 0, Duration::ZERO,
+    )
+    .await
+}
+
+/// Full variant with per-sample retries and stagger delay between sample starts.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_optimize_samples_full(
+    kind: &crate::cli::EvalKind,
+    workdir: PathBuf,
+    samples: u32,
+    jobs: usize,
+    timeout: Duration,
+    log_dir: Option<PathBuf>,
+    iter: u32,
+    agent_idx: u32,
+    retries: u32,
+    delay_between: Duration,
 ) -> Vec<EvalSample> {
     use crate::cli::EvalKind;
     let target = match kind {
@@ -345,11 +390,19 @@ pub async fn run_optimize_samples(
             .map(|d| d.join(format!("eval-{iter}-{agent_idx}-{k}.log")));
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem.acquire_owned().await.unwrap();
-            if is_memory {
-                run_memory_once(&cmd, &dir, timeout, log.as_deref()).await
-            } else {
-                run_speed_once(&cmd, &dir, timeout, log.as_deref()).await
+            if !delay_between.is_zero() && k > 0 {
+                tokio::time::sleep(delay_between * k).await;
             }
+            run_optimize_once_with_retries(
+                &cmd,
+                is_memory,
+                &dir,
+                timeout,
+                log.as_deref(),
+                retries,
+                delay_between,
+            )
+            .await
         }));
     }
     let mut out = Vec::new();
@@ -364,8 +417,49 @@ pub async fn run_optimize_samples(
     }
     out
 }
+
+/// Retry wrapper shared by speed/memory evals.
+pub async fn run_optimize_once_with_retries(
+    target_cmd: &str,
+    is_memory: bool,
+    workdir: &Path,
+    timeout: Duration,
+    log_file: Option<&Path>,
+    retries: u32,
+    delay_between: Duration,
+) -> EvalSample {
+    let once = |cmd: String, dir: PathBuf, log: Option<PathBuf>| async move {
+        if is_memory {
+            run_memory_once(&cmd, &dir, timeout, log.as_deref()).await
+        } else {
+            run_speed_once(&cmd, &dir, timeout, log.as_deref()).await
+        }
+    };
+    let mut sample = once(
+        target_cmd.to_string(),
+        workdir.to_path_buf(),
+        log_file.map(Path::to_path_buf),
+    )
+    .await;
+    for _ in 0..retries {
+        if sample.score.is_some() {
+            break;
+        }
+        if !delay_between.is_zero() {
+            tokio::time::sleep(delay_between).await;
+        }
+        sample = once(
+            target_cmd.to_string(),
+            workdir.to_path_buf(),
+            log_file.map(Path::to_path_buf),
+        )
+        .await;
+    }
+    sample
+}
 /// Run `samples` evals with bounded concurrency; returns per-sample results in order.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy wrapper; full variant preferred in binary. Used in tests.
 pub async fn run_eval_samples(
     eval_cmd: &str,
     workdir: PathBuf,
@@ -375,6 +469,37 @@ pub async fn run_eval_samples(
     log_dir: Option<PathBuf>,
     iter: u32,
     agent_idx: u32,
+) -> Vec<EvalSample> {
+    run_eval_samples_full(
+        eval_cmd,
+        workdir,
+        samples,
+        jobs,
+        timeout,
+        log_dir,
+        iter,
+        agent_idx,
+        0,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Full variant with per-sample retries and stagger delay between sample starts.
+/// `delay_between` is slept between retry attempts and staggered (k * delay)
+/// before starting sample k, giving rate-limited evals breathing room.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_eval_samples_full(
+    eval_cmd: &str,
+    workdir: PathBuf,
+    samples: u32,
+    jobs: usize,
+    timeout: Duration,
+    log_dir: Option<PathBuf>,
+    iter: u32,
+    agent_idx: u32,
+    retries: u32,
+    delay_between: Duration,
 ) -> Vec<EvalSample> {
     let jobs = jobs.max(1);
     let sem = Arc::new(Semaphore::new(jobs));
@@ -388,7 +513,11 @@ pub async fn run_eval_samples(
             .map(|d| d.join(format!("eval-{iter}-{agent_idx}-{k}.log")));
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem.acquire_owned().await.unwrap();
-            run_eval_once(&cmd, &dir, timeout, log.as_deref()).await
+            if !delay_between.is_zero() && k > 0 {
+                tokio::time::sleep(delay_between * k).await;
+            }
+            run_eval_once_with_retries(&cmd, &dir, timeout, log.as_deref(), retries, delay_between)
+                .await
         }));
     }
     let mut out = Vec::new();
@@ -610,6 +739,58 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(logdir.path().join("eval-1-2-0.log").exists());
         assert!(logdir.path().join("eval-1-2-1.log").exists());
+    }
+
+    #[tokio::test]
+    async fn retries_recover_from_flaky_eval() {
+        // First attempt fails, retry-marker file makes second attempt succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("flaky.marker");
+        let marker_s = marker.to_str().unwrap().to_string();
+        let cmd = format!(
+            "if [ -f {marker_s} ]; then echo 1.0; else touch {marker_s}; exit 1; fi"
+        );
+        let s = run_eval_once_with_retries(
+            &cmd,
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            1,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(s.score, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn retries_exhausted_keep_last_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_eval_once_with_retries(
+            "exit 1",
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            2,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(s.score, None);
+    }
+
+    #[tokio::test]
+    async fn retries_zero_means_single_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_eval_once_with_retries(
+            "exit 1",
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            0,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(s.score, None);
+        assert_eq!(s.exit_code, Some(1));
     }
 
     #[test]
