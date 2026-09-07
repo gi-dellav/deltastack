@@ -2,7 +2,7 @@
 name = "deltastack"
 version = "0.1.0"
 edition = "2021"
-description = "Automated eval-based research loop on top of zerostack (autoresearch core concept)"
+description = "Automated eval-based research loop, powered by zerostack"
 license = "MIT"
 
 [[bin]]

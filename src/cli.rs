@@ -29,10 +29,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 10)]
     pub max_iterations: u32,
 
-    /// Concurrent agents per iteration.
-    ///
-    /// When >1, each agent runs in its own worktree created via zerostack's
-    /// integrated `--worktree` (or `--parallel`) workflow flag.
+    /// Concurrent agents per iteration (each runs in its own worktree via zerostack's integrated --worktree flag).
     #[arg(long, default_value_t = 1)]
     pub agents: u32,
 
@@ -89,38 +86,48 @@ pub struct Cli {
     pub keep_worktrees: bool,
 
     // ---------- zerostack agent passthrough (explicit subset) ----------
+    /// set-up model and providers used
     #[arg(long)]
     pub provider: Option<String>,
+    /// set-up model and providers used
     #[arg(long)]
     pub model: Option<String>,
+    /// set-up model from a set of configured provider-model combinations
     #[arg(long)]
     pub quick_model: Option<String>,
+    /// max tokens for the model response
     #[arg(long)]
     pub max_tokens: Option<u32>,
+    /// max turns for the coding agent
     #[arg(long)]
     pub max_agent_turns: Option<u32>,
+    /// sampling temperature for the model
     #[arg(long)]
     pub temperature: Option<f64>,
     /// Allowlisted tools, comma-separated; repeatable. Passed as `--tools <CSV>`.
     #[arg(short, long = "tools")]
     pub tools: Vec<String>,
+    /// don't load AGENTS.md and similar files
     #[arg(long, default_value_t = false)]
     pub no_context_files: bool,
+    /// auto-accept all agent actions
     #[arg(long, default_value_t = false)]
     pub accept_all: bool,
+    /// run agent in yolo mode (auto-approve everything)
     #[arg(long, default_value_t = false)]
     pub yolo: bool,
+    /// skip all permission checks (dangerous)
     #[arg(long, default_value_t = false)]
     pub dangerously_skip_permissions: bool,
+    /// run the coding agent in a sandbox
     #[arg(long, default_value_t = false)]
     pub sandbox: bool,
     /// Passed as `--sandbox-network[=true|false]` when set.
     #[arg(long)]
     pub sandbox_network: Option<bool>,
+    /// shell binary used by the coding agent
     #[arg(long)]
     pub shell: Option<String>,
-    #[arg(long)]
-    pub edit_system: Option<String>,
 
     // ---------- zerostack integrated workflow flags (multi-agent isolation) ----------
     /// Base directory for worktrees created via `--worktree` (passed through).
@@ -129,28 +136,18 @@ pub struct Cli {
     /// Pass `--wt-force` to zerostack (force worktree remove/branch delete even if dirty).
     #[arg(long, default_value_t = false)]
     pub wt_force: bool,
-    /// Pass `--wt-auto-merge` to zerostack.
-    ///
-    /// WARNING: with auto-merge, zerostack merges the worktree branch on exit
-    /// *before* deltastack scores it, bypassing the eval gate. Keep OFF unless
-    /// you know what you are doing; deltastack merges the winner itself.
+    /// Pass `--wt-auto-merge` to zerostack. WARNING: merges worktree branch on exit before deltastack scores it, bypassing the eval gate. Keep OFF.
     #[arg(long, default_value_t = false)]
     pub wt_auto_merge: bool,
-    /// Use zerostack `--parallel` (timestamp worktree name + auto-merge) instead of
-    /// deterministic `--worktree <branch-prefix>iter<i>-agent<j>`.
-    /// Note: implies auto-merge semantics; prefer default deterministic mode for eval gating.
-    #[arg(long, default_value_t = false)]
-    pub use_parallel_timestamp: bool,
-    /// Force in-place execution (no `--worktree`/`--parallel` even when agents>1).
-    /// Refused when agents>1 (would make parallel agents clash).
+    /// Force in-place execution (no `--worktree` even when agents>1). Refused when agents>1 (would make parallel agents clash).
     #[arg(long, default_value_t = false)]
     pub no_isolate: bool,
-    /// Prefix for zerostack `--name <prefix>-iter<i>-agent<j>` sessions.
+    /// Prefix for zerostack `--name <prefix>-iter<i>-agent<j>` sessions (only with --keep-agent-session).
     #[arg(long, default_value = "deltastack")]
     pub agent_session_prefix: String,
-    /// Pass `--no-session` (ephemeral zerostack sessions).
+    /// Keep zerostack agent sessions (pass `--name`); default is ephemeral (`--no-session`).
     #[arg(long, default_value_t = false)]
-    pub no_agent_session: bool,
+    pub keep_agent_session: bool,
 
     // ---------- Commit behavior ----------
     /// Don't append the "git commit when done" suffix to agent prompts.
@@ -170,8 +167,10 @@ pub struct Cli {
     /// Print zerostack + eval commands without running anything.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    /// Verbose output.
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
+    /// Quiet output (warnings only).
     #[arg(short, long, default_value_t = false)]
     pub quiet: bool,
 }
@@ -229,9 +228,6 @@ impl Cli {
         }
         if self.no_isolate && self.agents > 1 {
             anyhow::bail!("--no-isolate cannot be used with --agents > 1 (parallel agents would clash on the same checkout)");
-        }
-        if self.use_parallel_timestamp && self.no_isolate {
-            anyhow::bail!("--use-parallel-timestamp conflicts with --no-isolate");
         }
         if self.eval_cmd.trim().is_empty() {
             anyhow::bail!("--eval must not be empty");
@@ -327,11 +323,10 @@ mod tests {
     }
 
     #[test]
-    fn parallel_timestamp_conflicts_with_no_isolate() {
-        let mut c = base_cli();
-        c.no_isolate = true;
-        c.use_parallel_timestamp = true;
-        assert!(c.validate().is_err());
+    fn session_ephemeral_by_default() {
+        let c = base_cli();
+        assert!(!c.keep_agent_session);
+        assert!(c.validate().is_ok());
     }
 
     #[test]

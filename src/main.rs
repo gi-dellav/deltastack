@@ -40,11 +40,6 @@ async fn main() -> anyhow::Result<()> {
             "--wt-auto-merge is ON: zerostack will merge worktrees on exit BEFORE eval gating. Prefer OFF."
         );
     }
-    if cli.use_parallel_timestamp {
-        warn!(
-            "--use-parallel-timestamp implies zerostack auto-merge semantics; eval gating may be bypassed. Prefer deterministic --worktree (default)."
-        );
-    }
 
     tokio::fs::create_dir_all(&cli.log_dir).await?;
 
@@ -95,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             cli.max_iterations, cli.agents
         );
 
-        // Spawn agents (parallel). Each builds its own prompt; isolation via zerostack --worktree.
+        // Spawn agents (concurrent). Each builds its own prompt; isolation via zerostack --worktree.
         let mut handles = Vec::new();
         for j in 0..cli.agents {
             let c = cli.clone();
@@ -305,7 +300,7 @@ async fn run_single_agent(
 
     // Isolation: let zerostack create the worktree via its integrated flag.
     // We resolve the path afterwards via `git worktree list`.
-    let branch = if cli.uses_worktree_isolation() && !cli.use_parallel_timestamp {
+    let branch = if cli.uses_worktree_isolation() {
         Some(crate::git::worktree_branch_name(
             &cli.branch_prefix,
             iteration,
@@ -323,8 +318,8 @@ async fn run_single_agent(
         match resolve_agent_worktree(repo, cli, iteration, agent_idx).await {
             Some(p) => (p.clone(), Some(p)),
             None => {
-                // Fallback: zerostack may have failed before creating the worktree,
-                // or used --parallel timestamp naming. Run eval in-place and continue.
+                // Fallback: zerostack may have failed before creating the worktree.
+                // Run eval in-place and continue.
                 warn!("agent {agent_idx}: worktree not found after run; evaluating in-place");
                 (repo.to_path_buf(), None)
             }
@@ -368,9 +363,6 @@ async fn resolve_agent_worktree(
     iteration: u32,
     agent_idx: u32,
 ) -> Option<PathBuf> {
-    if cli.use_parallel_timestamp {
-        return None; // timestamp names unknowable; caller falls back to in-place
-    }
     let branch = crate::git::worktree_branch_name(&cli.branch_prefix, iteration, agent_idx);
     let list = git::list_worktrees(repo).await.ok()?;
     git::find_worktree_for_branch(&list, &branch)

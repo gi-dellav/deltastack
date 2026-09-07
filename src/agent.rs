@@ -19,10 +19,9 @@ pub fn flatten_tools(tools: &[String]) -> Vec<String> {
 
 /// Build the `zerostack` argv for one (iteration, agent).
 ///
-/// Multi-agent isolation uses zerostack's *integrated* workflow flags:
+/// Multi-agent isolation uses zerostack's *integrated* workflow flag:
 ///
 /// - default: `--worktree <deterministic-name>` (zerostack creates the worktree)
-/// - `--use-parallel-timestamp`: `--parallel` (timestamp name + auto-merge)
 ///
 /// Single-agent in-place passes neither (unless `--wt-base-dir` forces isolation).
 #[allow(clippy::too_many_arguments)]
@@ -34,15 +33,16 @@ pub fn build_zerostack_argv(
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec!["-p".into(), full_prompt.to_string()];
 
-    // Session naming for traceability (`zerostack --resume`).
-    if cli.no_agent_session {
-        argv.push("--no-session".into());
-    } else {
+    // Sessions are ephemeral by default (`--no-session`); opt into named
+    // sessions with --keep-agent-session (`--name ...` for `zerostack --resume`).
+    if cli.keep_agent_session {
         argv.push("--name".into());
         argv.push(format!(
             "{}-iter{}-agent{}",
             cli.agent_session_prefix, iteration, agent_idx
         ));
+    } else {
+        argv.push("--no-session".into());
     }
 
     // passthrough model/limits
@@ -98,23 +98,15 @@ pub fn build_zerostack_argv(
         argv.push("--shell".into());
         argv.push(v.clone());
     }
-    if let Some(v) = &cli.edit_system {
-        argv.push("--edit-system".into());
-        argv.push(v.clone());
-    }
 
     // ---- integrated workflow flags (isolation) ----
     if cli.uses_worktree_isolation() {
-        if cli.use_parallel_timestamp {
-            argv.push("--parallel".into());
-        } else {
-            argv.push("--worktree".into());
-            argv.push(zerostack_worktree_name(
-                &cli.branch_prefix,
-                iteration,
-                agent_idx,
-            ));
-        }
+        argv.push("--worktree".into());
+        argv.push(zerostack_worktree_name(
+            &cli.branch_prefix,
+            iteration,
+            agent_idx,
+        ));
         if cli.wt_auto_merge {
             argv.push("--wt-auto-merge".into());
         }
@@ -239,7 +231,7 @@ mod tests {
         let c = cli(&[]);
         let argv = build_zerostack_argv(&c, 0, 0, "prompt");
         assert!(argv.contains(&"-p".to_string()));
-        assert!(!argv.iter().any(|a| a == "--worktree" || a == "--parallel"));
+        assert!(!argv.iter().any(|a| a == "--worktree"));
     }
 
     #[test]
@@ -251,15 +243,23 @@ mod tests {
             .position(|a| a == "--worktree")
             .expect("should have --worktree");
         assert_eq!(argv[pos + 1], "deltastack-iter3-agent1");
-        assert!(!argv.iter().any(|a| a == "--parallel"));
     }
 
     #[test]
-    fn parallel_timestamp_mode_uses_parallel_flag() {
-        let c = cli(&["--agents", "2", "--use-parallel-timestamp"]);
+    fn session_ephemeral_by_default() {
+        let c = cli(&[]);
         let argv = build_zerostack_argv(&c, 0, 0, "p");
-        assert!(argv.contains(&"--parallel".to_string()));
-        assert!(!argv.iter().any(|a| a == "--worktree"));
+        assert!(argv.contains(&"--no-session".to_string()));
+        assert!(!argv.iter().any(|a| a == "--name"));
+    }
+
+    #[test]
+    fn keep_session_flag() {
+        let c = cli(&["--keep-agent-session"]);
+        let argv = build_zerostack_argv(&c, 2, 3, "p");
+        let pos = argv.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(argv[pos + 1], "deltastack-iter2-agent3");
+        assert!(!argv.iter().any(|a| a == "--no-session"));
     }
 
     #[test]
@@ -290,16 +290,17 @@ mod tests {
     }
 
     #[test]
-    fn session_naming_default() {
-        let c = cli(&[]);
+    fn session_naming_with_keep_flag() {
+        let c = cli(&["--keep-agent-session"]);
         let argv = build_zerostack_argv(&c, 2, 3, "p");
         let pos = argv.iter().position(|a| a == "--name").unwrap();
         assert_eq!(argv[pos + 1], "deltastack-iter2-agent3");
+        assert!(!argv.iter().any(|a| a == "--no-session"));
     }
 
     #[test]
-    fn no_session_flag() {
-        let c = cli(&["--no-agent-session"]);
+    fn no_session_by_default() {
+        let c = cli(&[]);
         let argv = build_zerostack_argv(&c, 0, 0, "p");
         assert!(argv.contains(&"--no-session".to_string()));
         assert!(!argv.iter().any(|a| a == "--name"));
