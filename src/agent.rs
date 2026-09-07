@@ -43,9 +43,9 @@ pub fn resolve_temperature(cli: &Cli, iteration: u32, rng: &mut impl RngExt) -> 
 ///
 /// Multi-agent isolation uses zerostack's *integrated* workflow flag:
 ///
-/// - default: `--worktree <deterministic-name>` (zerostack creates the worktree)
+/// - with `--agents > 1`: `--worktree <deterministic-name>` (zerostack creates the worktree)
 ///
-/// Single-agent in-place passes neither (unless `--wt-base-dir` forces isolation).
+/// Single-agent (`--agents 1`) always runs in-place and passes no worktree flags.
 #[allow(clippy::too_many_arguments)]
 pub fn build_zerostack_argv(
     cli: &Cli,
@@ -303,12 +303,20 @@ mod tests {
 
     #[test]
     fn wt_flags_absent_in_place_mode() {
-        let c = cli(&["--no-isolate", "--wt-auto-merge"]);
-        let argv = build_zerostack_argv(&c, 0, 0, "p");
+        let c = cli(&["--agents", "2", "--no-isolate", "--wt-auto-merge"]);
         // isolation disabled -> no worktree machinery forwarded
+        let argv = build_zerostack_argv(&c, 0, 0, "p");
         assert!(!argv
             .iter()
             .any(|a| a == "--worktree" || a == "--wt-auto-merge"));
+    }
+
+    #[test]
+    fn wt_base_dir_alone_does_not_trigger_worktree_for_single_agent() {
+        let c = cli(&["--wt-base-dir", "/tmp/wt"]);
+        let argv = build_zerostack_argv(&c, 0, 0, "p");
+        assert!(!argv.iter().any(|a| a == "--worktree"));
+        assert!(!argv.iter().any(|a| a == "--wt-base-dir"));
     }
 
     #[test]

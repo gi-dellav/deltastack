@@ -144,7 +144,7 @@ pub struct Cli {
     pub shell: Option<String>,
 
     // ---------- zerostack integrated workflow flags (multi-agent isolation) ----------
-    /// Base directory for worktrees created via `--worktree` (passed through).
+    /// Base directory for worktrees (only used with --agents > 1; passed through as --wt-base-dir).
     #[arg(long)]
     pub wt_base_dir: Option<String>,
     /// Pass `--wt-force` to zerostack (force worktree remove/branch delete even if dirty).
@@ -153,7 +153,9 @@ pub struct Cli {
     /// Pass `--wt-auto-merge` to zerostack. WARNING: merges worktree branch on exit before deltastack scores it, bypassing the eval gate. Keep OFF.
     #[arg(long, default_value_t = false)]
     pub wt_auto_merge: bool,
-    /// Force in-place execution (no `--worktree` even when agents>1). Refused when agents>1 (would make parallel agents clash).
+    /// Force in-place execution. Single-agent runs are always in-place, so this
+    /// is a no-op there; refused with --agents > 1 (parallel agents would clash
+    /// on the same checkout).
     #[arg(long, default_value_t = false)]
     pub no_isolate: bool,
     /// Prefix for zerostack `--name <prefix>-iter<i>-agent<j>` sessions (only with --keep-agent-session).
@@ -288,12 +290,11 @@ impl Cli {
     }
 
     /// Whether this iteration setup isolates agents in worktrees.
-    /// Single-agent defaults to in-place; multi-agent defaults to zerostack `--worktree`.
+    /// Single-agent runs always execute in-place; multi-agent runs isolate
+    /// via zerostack `--worktree`. `--wt-base-dir` alone never enables
+    /// worktrees for a single agent.
     pub fn uses_worktree_isolation(&self) -> bool {
-        if self.no_isolate {
-            return false;
-        }
-        self.agents > 1 || self.wt_base_dir.is_some()
+        self.agents > 1 && !self.no_isolate
     }
 }
 
@@ -361,9 +362,27 @@ mod tests {
             "x",
             "--eval",
             "echo 1",
+            "--agents",
+            "2",
             "--no-isolate",
         ]);
         assert!(!c.uses_worktree_isolation());
+    }
+
+    #[test]
+    fn wt_base_dir_alone_does_not_enable_worktrees_for_single_agent() {
+        let c = Cli::parse_from([
+            "deltastack",
+            "--prompt",
+            "x",
+            "--eval",
+            "echo 1",
+            "--wt-base-dir",
+            "/tmp/wt",
+        ]);
+        assert_eq!(c.agents, 1);
+        assert!(!c.uses_worktree_isolation());
+        assert!(c.validate().is_ok());
     }
 
     #[test]

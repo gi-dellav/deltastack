@@ -35,9 +35,16 @@ async fn main() -> anyhow::Result<()> {
     if !cli.allow_dirty && !git::is_clean_filtered(&repo, &cli.state_file, &cli.log_dir).await? {
         anyhow::bail!("git tree is dirty; commit/stash first or pass --allow-dirty");
     }
-    if cli.wt_auto_merge {
+    if cli.wt_auto_merge && cli.uses_worktree_isolation() {
         warn!(
             "--wt-auto-merge is ON: zerostack will merge worktrees on exit BEFORE eval gating. Prefer OFF."
+        );
+    }
+    if !cli.uses_worktree_isolation()
+        && (cli.wt_base_dir.is_some() || cli.wt_force || cli.wt_auto_merge)
+    {
+        warn!(
+            "worktree flags (--wt-base-dir/--wt-force/--wt-auto-merge) are ignored with --agents 1 (single-agent runs execute in-place)"
         );
     }
 
