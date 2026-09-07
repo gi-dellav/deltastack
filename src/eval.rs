@@ -57,6 +57,175 @@ pub struct EvalSample {
     pub timed_out: bool,
 }
 
+/// Which GNU time binary to use for `--optimize-memory`.
+/// `GTIME_BIN` env overrides; otherwise `/usr/bin/time`, then `gtime` (macOS brew).
+pub fn gnu_time_bin() -> String {
+    if let Ok(b) = std::env::var("GTIME_BIN") {
+        if !b.trim().is_empty() {
+            return b;
+        }
+    }
+    if Path::new("/usr/bin/time").exists() {
+        return "/usr/bin/time".to_string();
+    }
+    "gtime".to_string()
+}
+
+/// Parse peak RSS (kB) from GNU `time -v` stderr.
+/// Looks for `Maximum resident set size (kbytes): <N>`.
+pub fn parse_peak_rss_kb(time_stderr: &str) -> anyhow::Result<f64> {
+    for line in time_stderr.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Maximum resident set size (kbytes):") {
+            let v: f64 = rest.trim().parse().map_err(|_| {
+                anyhow::anyhow!("cannot parse peak RSS from {t:?} (full output: {time_stderr:?})")
+            })?;
+            if !v.is_finite() || v < 0.0 {
+                anyhow::bail!("peak RSS is not a finite non-negative value: {v}");
+            }
+            return Ok(v);
+        }
+    }
+    anyhow::bail!("GNU time output missing 'Maximum resident set size (kbytes)' (output: {time_stderr:?})")
+}
+
+/// Run the target command once and score wall-clock seconds (lower is better).
+/// Non-zero exit or unparsable run => score None (same EvalSample shape as custom eval).
+pub async fn run_speed_once(
+    target_cmd: &str,
+    workdir: &Path,
+    timeout: Duration,
+    log_file: Option<&Path>,
+) -> EvalSample {
+    use std::time::Instant;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(target_cmd).current_dir(workdir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let start = Instant::now();
+    let run = async {
+        let out = cmd.output().await?;
+        anyhow::Ok(out)
+    };
+
+    let timed = if timeout.is_zero() {
+        run.await.map_err(|e| (e, false))
+    } else {
+        match tokio::time::timeout(timeout, run).await {
+            Ok(r) => r.map_err(|e| (e, false)),
+            Err(_) => Err((anyhow::anyhow!("eval timed out"), true)),
+        }
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let (stdout, stderr, exit_code, timed_out, score) = match timed {
+        Err((e, to)) => (String::new(), e.to_string(), None, to, None),
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let code = output.status.code();
+            let score = if output.status.success() {
+                Some(elapsed)
+            } else {
+                None
+            };
+            (stdout, stderr, code, false, score)
+        }
+    };
+
+    if let Some(path) = log_file {
+        let _ = write_eval_log(
+            path,
+            &format!("{target_cmd}  [optimize-speed: {elapsed:.6}s]"),
+            workdir,
+            &stdout,
+            &stderr,
+            exit_code,
+            score,
+        )
+        .await;
+    }
+
+    EvalSample {
+        score,
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+    }
+}
+
+/// Run the target command once under GNU `time -v` and score peak RSS kB (lower is better).
+/// Score is Some(kB) only when the inner command exits 0 and the RSS line parses.
+pub async fn run_memory_once(
+    target_cmd: &str,
+    workdir: &Path,
+    timeout: Duration,
+    log_file: Option<&Path>,
+) -> EvalSample {
+    let time_bin = gnu_time_bin();
+    let mut cmd = Command::new(&time_bin);
+    cmd.arg("-v")
+        .arg("sh")
+        .arg("-c")
+        .arg(target_cmd)
+        .current_dir(workdir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let run = async {
+        let out = cmd.output().await?;
+        anyhow::Ok(out)
+    };
+
+    let timed = if timeout.is_zero() {
+        run.await.map_err(|e| (e, false))
+    } else {
+        match tokio::time::timeout(timeout, run).await {
+            Ok(r) => r.map_err(|e| (e, false)),
+            Err(_) => Err((anyhow::anyhow!("eval timed out"), true)),
+        }
+    };
+
+    let (stdout, stderr, exit_code, timed_out, score) = match timed {
+        Err((e, to)) => (String::new(), e.to_string(), None, to, None),
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            // GNU time writes its report to stderr, merged with the child's stderr.
+            let time_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let code = output.status.code();
+            let score = if output.status.success() {
+                parse_peak_rss_kb(&time_stderr).ok()
+            } else {
+                None
+            };
+            (stdout, time_stderr, code, false, score)
+        }
+    };
+
+    if let Some(path) = log_file {
+        let _ = write_eval_log(
+            path,
+            &format!("{time_bin} -v sh -c {target_cmd:?}  [optimize-memory]"),
+            workdir,
+            &stdout,
+            &stderr,
+            exit_code,
+            score,
+        )
+        .await;
+    }
+
+    EvalSample {
+        score,
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+    }
+}
+
 /// Run the eval command once in `workdir`.
 pub async fn run_eval_once(
     eval_cmd: &str,
@@ -130,6 +299,71 @@ async fn write_eval_log(
     let _ = tokio::fs::write(path, body).await;
 }
 
+/// GNU time is required for --optimize-memory. Fail fast with install hint.
+pub async fn check_gnu_time_available() -> anyhow::Result<String> {
+    let bin = gnu_time_bin();
+    let probe = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("GNU time not found at {bin:?} ({e}); install it (apt install time / brew install gnu-time) or set GTIME_BIN"))?;
+    let out = String::from_utf8_lossy(&probe.stdout).to_string()
+        + &String::from_utf8_lossy(&probe.stderr).to_string();
+    if !out.contains("GNU time") {
+        anyhow::bail!("{bin:?} does not look like GNU time (need `time -v` with 'Maximum resident set size'); install GNU time (apt install time / brew install gnu-time) or set GTIME_BIN");
+    }
+    Ok(bin)
+}
+
+/// Run `samples` speed/memory evals with bounded concurrency; returns per-sample results in order.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_optimize_samples(
+    kind: &crate::cli::EvalKind,
+    workdir: PathBuf,
+    samples: u32,
+    jobs: usize,
+    timeout: Duration,
+    log_dir: Option<PathBuf>,
+    iter: u32,
+    agent_idx: u32,
+) -> Vec<EvalSample> {
+    use crate::cli::EvalKind;
+    let target = match kind {
+        EvalKind::Speed(c) | EvalKind::Memory(c) => c.clone(),
+        EvalKind::Custom(c) => c.clone(),
+    };
+    let is_memory = matches!(kind, EvalKind::Memory(_));
+    let jobs = jobs.max(1);
+    let sem = Arc::new(Semaphore::new(jobs));
+    let mut handles = Vec::new();
+    for k in 0..samples {
+        let permit_sem = sem.clone();
+        let cmd = target.clone();
+        let dir = workdir.clone();
+        let log = log_dir
+            .clone()
+            .map(|d| d.join(format!("eval-{iter}-{agent_idx}-{k}.log")));
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem.acquire_owned().await.unwrap();
+            if is_memory {
+                run_memory_once(&cmd, &dir, timeout, log.as_deref()).await
+            } else {
+                run_speed_once(&cmd, &dir, timeout, log.as_deref()).await
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for h in handles {
+        out.push(h.await.unwrap_or(EvalSample {
+            score: None,
+            stdout: String::new(),
+            stderr: "eval task panicked".into(),
+            exit_code: None,
+            timed_out: false,
+        }));
+    }
+    out
+}
 /// Run `samples` evals with bounded concurrency; returns per-sample results in order.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_eval_samples(
@@ -376,5 +610,57 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(logdir.path().join("eval-1-2-0.log").exists());
         assert!(logdir.path().join("eval-1-2-1.log").exists());
+    }
+
+    #[test]
+    fn parse_peak_rss_kb_from_gnu_time_output() {
+        let stderr = "\tMaximum resident set size (kbytes): 12345\n\tMinor faults: 1\n";
+        assert_eq!(parse_peak_rss_kb(stderr).unwrap(), 12345.0);
+    }
+
+    #[test]
+    fn parse_peak_rss_kb_missing_line_errors() {
+        assert!(parse_peak_rss_kb("elapsed: 0.1\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_speed_once_measures_elapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_speed_once("true", dir.path(), Duration::from_secs(5), None).await;
+        assert_eq!(s.exit_code, Some(0));
+        let v = s.score.expect("speed score");
+        assert!(v >= 0.0 && v < 5.0, "score={v}");
+    }
+
+    #[tokio::test]
+    async fn run_speed_once_failure_has_no_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_speed_once("exit 3", dir.path(), Duration::from_secs(5), None).await;
+        assert_eq!(s.score, None);
+        assert_eq!(s.exit_code, Some(3));
+    }
+
+    // Requires GNU time (`apt install time` / `brew install gnu-time`).
+    #[tokio::test]
+    async fn run_memory_once_reports_kb() {
+        if check_gnu_time_available().await.is_err() {
+            eprintln!("skipping: GNU time not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_memory_once("echo hi", dir.path(), Duration::from_secs(10), None).await;
+        let v = s.score.expect("memory score");
+        assert!(v > 0.0, "score={v}");
+    }
+
+    #[tokio::test]
+    async fn run_memory_once_failure_has_no_score() {
+        if check_gnu_time_available().await.is_err() {
+            eprintln!("skipping: GNU time not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = run_memory_once("exit 3", dir.path(), Duration::from_secs(10), None).await;
+        assert_eq!(s.score, None);
     }
 }

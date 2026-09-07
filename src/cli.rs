@@ -17,8 +17,19 @@ pub struct Cli {
     pub prompt_file: Option<String>,
 
     /// Eval shell command (run via `sh -c`). Stdout must be a single float.
-    #[arg(short, long = "eval")]
-    pub eval_cmd: String,
+    #[arg(short, long = "eval", conflicts_with_all = ["optimize_speed", "optimize_memory"])]
+    pub eval_cmd: Option<String>,
+
+    /// Optimize wall-clock time of CMD (run via `sh -c`). Score = seconds (lower is better).
+    /// Replaces --eval; provides a default prompt (override with --prompt/--prompt-file).
+    #[arg(long, value_name = "CMD", conflicts_with_all = ["eval_cmd", "optimize_memory"])]
+    pub optimize_speed: Option<String>,
+
+    /// Optimize peak memory of CMD (run via `sh -c` under GNU `time -v`).
+    /// Score = peak RSS in kilobytes (lower is better). Replaces --eval;
+    /// provides a default prompt (override with --prompt/--prompt-file).
+    #[arg(long, value_name = "CMD", conflicts_with_all = ["eval_cmd", "optimize_speed"])]
+    pub optimize_memory: Option<String>,
 
     /// zerostack binary path.
     #[arg(long, default_value = "zerostack")]
@@ -191,6 +202,15 @@ pub struct Cli {
     pub quiet: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvalKind {
+    /// Custom eval script: stdout must be a single float.
+    Custom(String),
+    /// Wall-clock optimization: score = seconds.
+    Speed(String),
+    /// Peak-memory optimization: score = kB via GNU `time -v`.
+    Memory(String),
+}
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
     /// Higher score is better.
@@ -220,9 +240,58 @@ impl Cli {
         total.min(self.samples.max(1) as usize).max(1)
     }
 
+    /// Which eval source is configured. Exactly one of --eval / --optimize-speed / --optimize-memory.
+    pub fn eval_kind(&self) -> Option<EvalKind> {
+        match (
+            self.eval_cmd.as_deref(),
+            self.optimize_speed.as_deref(),
+            self.optimize_memory.as_deref(),
+        ) {
+            (Some(c), None, None) => Some(EvalKind::Custom(c.to_string())),
+            (None, Some(c), None) => Some(EvalKind::Speed(c.to_string())),
+            (None, None, Some(c)) => Some(EvalKind::Memory(c.to_string())),
+            _ => None,
+        }
+    }
+
+    /// Whether a built-in optimize prompt applies (prompt optional in that case).
+    pub fn is_optimize_mode(&self) -> bool {
+        matches!(
+            self.eval_kind(),
+            Some(EvalKind::Speed(_)) | Some(EvalKind::Memory(_))
+        )
+    }
+
     /// Validate flag combinations. Called from main before running.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.prompt.is_none() && self.prompt_file.is_none() {
+        let n_eval = [&self.eval_cmd, &self.optimize_speed, &self.optimize_memory]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+        if n_eval == 0 {
+            anyhow::bail!("one of --eval, --optimize-speed <CMD> or --optimize-memory <CMD> is required");
+        }
+        if n_eval > 1 {
+            anyhow::bail!("--eval, --optimize-speed and --optimize-memory are mutually exclusive");
+        }
+        match self.eval_kind() {
+            Some(EvalKind::Custom(c)) if c.trim().is_empty() => {
+                anyhow::bail!("--eval must not be empty");
+            }
+            Some(EvalKind::Speed(c)) if c.trim().is_empty() => {
+                anyhow::bail!("--optimize-speed must not be empty");
+            }
+            Some(EvalKind::Memory(c)) if c.trim().is_empty() => {
+                anyhow::bail!("--optimize-memory must not be empty");
+            }
+            None => {
+                anyhow::bail!("one of --eval, --optimize-speed <CMD> or --optimize-memory <CMD> is required");
+            }
+            _ => {}
+        }
+        // Prompt is required for custom eval; optimize modes supply a default
+        // prompt but still allow --prompt/--prompt-file to override it.
+        if !self.is_optimize_mode() && self.prompt.is_none() && self.prompt_file.is_none() {
             anyhow::bail!("one of --prompt or --prompt-file is required");
         }
         if self.max_iterations == 0 {
@@ -283,9 +352,6 @@ impl Cli {
         if self.no_isolate && self.agents > 1 {
             anyhow::bail!("--no-isolate cannot be used with --agents > 1 (parallel agents would clash on the same checkout)");
         }
-        if self.eval_cmd.trim().is_empty() {
-            anyhow::bail!("--eval must not be empty");
-        }
         Ok(())
     }
 
@@ -308,10 +374,74 @@ mod tests {
     }
 
     #[test]
-    fn requires_prompt_or_prompt_file() {
+    fn requires_prompt_or_prompt_file_for_custom_eval() {
         let mut c = base_cli();
         c.prompt = None;
         c.prompt_file = None;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn optimize_speed_needs_no_prompt() {
+        let c = Cli::parse_from(["deltastack", "--optimize-speed", "make bench"]);
+        assert_eq!(
+            c.eval_kind(),
+            Some(EvalKind::Speed("make bench".into()))
+        );
+        assert!(c.is_optimize_mode());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn optimize_memory_needs_no_prompt() {
+        let c = Cli::parse_from(["deltastack", "--optimize-memory", "make bench"]);
+        assert_eq!(
+            c.eval_kind(),
+            Some(EvalKind::Memory("make bench".into()))
+        );
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_eval_source_is_rejected() {
+        let mut c = base_cli();
+        c.eval_cmd = None;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn eval_and_optimize_conflict_at_clap_level() {
+        let r = Cli::try_parse_from([
+            "deltastack",
+            "--prompt",
+            "a",
+            "--eval",
+            "echo 1",
+            "--optimize-speed",
+            "make bench",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn speed_and_memory_conflict_at_clap_level() {
+        let r = Cli::try_parse_from([
+            "deltastack",
+            "--optimize-speed",
+            "a",
+            "--optimize-memory",
+            "b",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rejects_empty_optimize_cmds() {
+        let mut c = Cli::parse_from(["deltastack", "--optimize-speed", "x"]);
+        c.optimize_speed = Some("  ".into());
+        assert!(c.validate().is_err());
+        let mut c = Cli::parse_from(["deltastack", "--optimize-memory", "x"]);
+        c.optimize_memory = Some("".into());
         assert!(c.validate().is_err());
     }
 

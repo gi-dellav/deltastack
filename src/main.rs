@@ -20,11 +20,31 @@ async fn main() -> anyhow::Result<()> {
     init_logging(&cli);
     cli.validate()?;
 
-    let user_prompt = prompt::load_user_prompt(cli.prompt.as_deref(), cli.prompt_file.as_deref())?;
+    let eval_kind = cli.eval_kind().ok_or_else(|| {
+        anyhow::anyhow!(
+            "one of --eval, --optimize-speed <CMD> or --optimize-memory <CMD> is required"
+        )
+    })?;
+    let default_prompt: Option<String> = match &eval_kind {
+        cli::EvalKind::Speed(c) => Some(prompt::default_optimize_speed_prompt(c)),
+        cli::EvalKind::Memory(c) => Some(prompt::default_optimize_memory_prompt(c)),
+        cli::EvalKind::Custom(_) => None,
+    };
+    let (user_prompt, used_default_prompt) = prompt::resolve_user_prompt(
+        cli.prompt.as_deref(),
+        cli.prompt_file.as_deref(),
+        default_prompt.as_deref(),
+    )?;
+    if used_default_prompt {
+        info!("using built-in optimize prompt (override with --prompt/--prompt-file)");
+    }
     let repo = std::env::current_dir()?;
 
     if cli.dry_run {
-        return dry_run(&cli, &user_prompt);
+        return dry_run(&cli, &user_prompt, &eval_kind);
+    }
+    if matches!(eval_kind, cli::EvalKind::Memory(_)) {
+        eval::check_gnu_time_available().await?;
     }
 
     if !git::is_git_repo(&repo).await {
@@ -53,8 +73,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- baseline ----
     let baseline_sha = git::current_sha(&repo).await?;
     info!("baseline commit {baseline_sha}");
-    let baseline_samples = eval::run_eval_samples(
-        &cli.eval_cmd,
+    let baseline_samples = run_eval_for_kind(
+        &eval_kind,
         repo.clone(),
         cli.samples,
         cli.effective_eval_jobs(),
@@ -339,8 +359,13 @@ async fn run_single_agent(
     let commit = normalize_commit(&exec_dir, cli, iteration, agent_idx).await?;
 
     // Eval samples in the candidate dir.
-    let samples = eval::run_eval_samples(
-        &cli.eval_cmd,
+    let kind = cli.eval_kind().ok_or_else(|| {
+        anyhow::anyhow!(
+            "one of --eval, --optimize-speed <CMD> or --optimize-memory <CMD> is required"
+        )
+    })?;
+    let samples = run_eval_for_kind(
+        &kind,
         exec_dir,
         cli.samples,
         cli.effective_eval_jobs(),
@@ -421,7 +446,31 @@ fn init_logging(cli: &Cli) {
         .try_init();
 }
 
-fn dry_run(cli: &Cli, user_prompt: &str) -> anyhow::Result<()> {
+/// Dispatch baseline/candidate evals to the configured eval kind.
+#[allow(clippy::too_many_arguments)]
+async fn run_eval_for_kind(
+    kind: &cli::EvalKind,
+    workdir: PathBuf,
+    samples: u32,
+    jobs: usize,
+    timeout: Duration,
+    log_dir: Option<PathBuf>,
+    iter: u32,
+    agent_idx: u32,
+) -> Vec<eval::EvalSample> {
+    match kind {
+        cli::EvalKind::Custom(cmd) => {
+            eval::run_eval_samples(cmd, workdir, samples, jobs, timeout, log_dir, iter, agent_idx)
+                .await
+        }
+        _ => {
+            eval::run_optimize_samples(kind, workdir, samples, jobs, timeout, log_dir, iter, agent_idx)
+                .await
+        }
+    }
+}
+
+fn dry_run(cli: &Cli, user_prompt: &str, kind: &cli::EvalKind) -> anyhow::Result<()> {
     let full = prompt::compose_iteration_prompt(
         user_prompt,
         1,
@@ -440,7 +489,18 @@ fn dry_run(cli: &Cli, user_prompt: &str) -> anyhow::Result<()> {
         cli.zerostack_bin,
         shlex::try_join(argv.iter().map(String::as_str)).unwrap_or_default()
     );
-    println!("\neval:\nsh -c {:?}", cli.eval_cmd);
+    match kind {
+        cli::EvalKind::Custom(cmd) => println!("\neval:\nsh -c {cmd:?}"),
+        cli::EvalKind::Speed(cmd) => {
+            println!("\noptimize-speed:\nsh -c {cmd:?}\nscore = wall-clock seconds (lower is better)");
+        }
+        cli::EvalKind::Memory(cmd) => {
+            println!(
+                "\noptimize-memory:\n{} -v sh -c {cmd:?}\nscore = peak RSS kilobytes (lower is better)",
+                eval::gnu_time_bin()
+            );
+        }
+    }
     println!(
         "\nmode={:?} aggregate={:?} agents={} samples={} isolation={}",
         cli.mode,

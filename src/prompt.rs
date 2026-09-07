@@ -1,11 +1,55 @@
 use std::fs;
 
 /// Load the user task prompt from `--prompt` or `--prompt-file`.
+/// Kept for the plain `--eval` path; optimize modes use [`resolve_user_prompt`].
+#[allow(dead_code)]
 pub fn load_user_prompt(prompt: Option<&str>, prompt_file: Option<&str>) -> anyhow::Result<String> {
     match (prompt, prompt_file) {
         (Some(p), None) => Ok(p.to_string()),
         (None, Some(f)) => Ok(fs::read_to_string(f)?),
         (None, None) => anyhow::bail!("one of --prompt or --prompt-file is required"),
+        (Some(_), Some(_)) => anyhow::bail!("--prompt conflicts with --prompt-file"),
+    }
+}
+
+/// Default task prompt for `--optimize-speed <cmd>`: minimize wall-clock time.
+pub fn default_optimize_speed_prompt(cmd: &str) -> String {
+    format!(
+        "Optimize the wall-clock running time of this command:\n`{cmd}`\n\n\
+         Edit the repository so the command runs faster. The score is the elapsed \
+         time in seconds (lower is better), aggregated over --samples runs. \
+         Keep the behavior/output of the command correct — do not break it, stub it out, \
+         skip work, or suppress output just to look faster. Only genuine speedups count."
+    )
+}
+
+/// Default task prompt for `--optimize-memory <cmd>`: minimize peak RSS.
+pub fn default_optimize_memory_prompt(cmd: &str) -> String {
+    format!(
+        "Optimize the peak memory usage of this command:\n`{cmd}`\n\n\
+         Edit the repository so the command uses less memory. The score is the peak \
+         resident set size in kilobytes measured with GNU `time -v` (lower is better), \
+         aggregated over --samples runs. Keep the behavior/output of the command correct — \
+         do not break it, stub it out, skip work, or suppress output just to look leaner. \
+         Only genuine memory reductions count."
+    )
+}
+
+/// Resolve the effective task prompt: explicit --prompt/--prompt-file wins,
+/// otherwise fall back to the built-in optimize default (if any).
+/// Returns the prompt plus whether it came from the built-in default.
+pub fn resolve_user_prompt(
+    prompt: Option<&str>,
+    prompt_file: Option<&str>,
+    default_prompt: Option<&str>,
+) -> anyhow::Result<(String, bool)> {
+    match (prompt, prompt_file) {
+        (Some(p), None) => Ok((p.to_string(), false)),
+        (None, Some(f)) => Ok((fs::read_to_string(f)?, false)),
+        (None, None) => match default_prompt {
+            Some(d) => Ok((d.to_string(), true)),
+            None => anyhow::bail!("one of --prompt or --prompt-file is required"),
+        },
         (Some(_), Some(_)) => anyhow::bail!("--prompt conflicts with --prompt-file"),
     }
 }
@@ -172,5 +216,41 @@ mod tests {
     fn compose_trims_user_prompt() {
         let p = compose_iteration_prompt("  Do X\n\n", 1, 2, 0, 1, None, None, None, "x/", false);
         assert!(p.starts_with("Do X\n\n---"), "{p}");
+    }
+
+    #[test]
+    fn default_speed_prompt_mentions_seconds_and_cmd() {
+        let p = default_optimize_speed_prompt("make bench");
+        assert!(p.contains("make bench"), "{p}");
+        assert!(p.contains("seconds"), "{p}");
+        assert!(p.contains("lower is better"), "{p}");
+    }
+
+    #[test]
+    fn default_memory_prompt_mentions_kb_and_cmd() {
+        let p = default_optimize_memory_prompt("make bench");
+        assert!(p.contains("make bench"), "{p}");
+        assert!(p.contains("kilobytes"), "{p}");
+        assert!(p.contains("lower is better"), "{p}");
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_prompt_over_default() {
+        let (p, used_default) =
+            resolve_user_prompt(Some("custom"), None, Some("default")).unwrap();
+        assert_eq!(p, "custom");
+        assert!(!used_default);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default() {
+        let (p, used_default) = resolve_user_prompt(None, None, Some("default")).unwrap();
+        assert_eq!(p, "default");
+        assert!(used_default);
+    }
+
+    #[test]
+    fn resolve_errors_without_any_prompt() {
+        assert!(resolve_user_prompt(None, None, None).is_err());
     }
 }
